@@ -4,7 +4,7 @@
 -- Scope: Credential rotation daemon for Bitwarden
 -- Includes:
 --   Server connection lifecycle
---   Rotation task lifecycle and retry behaviour
+--   Rotation attempt execution (one try at a rotation)
 --   Target system integrations: Entra, MSSQL, CustomScript
 --   Credential resolution for target system connections
 -- Excludes:
@@ -12,8 +12,15 @@
 --   Bitwarden Secrets Manager internals (external system)
 --   Password generation algorithm internals
 --   Deployment and containerisation (Docker, etc.)
+--   Rotation scheduling, the claim/pull mechanism, and retry orchestration across
+--     attempts -- all server-side (rotation-server.allium). The daemon executes a
+--     single attempt the server created for it and reports the outcome; a retry is a
+--     fresh attempt the server makes claimable again.
 
 config {
+    -- Retry budget for SESSION TERMINATION only. Rotation retries are orchestrated
+    -- server-side (a failed attempt makes the job claimable again); session
+    -- termination keeps its own independent retry loop here.
     max_retry_attempts: Integer = 5
     retry_base_delay: Duration = 1.second
 }
@@ -67,16 +74,19 @@ variant CustomScript : TargetSystem {
     command: String
 }
 
--- Rotation task
+-- Rotation attempt
+-- One try at rotating a credential. The server creates an attempt when a daemon
+-- claims a job (and a fresh one for each retry), then this daemon executes it. The
+-- attempt has no retry counter of its own -- the job (rotation-server.allium) counts
+-- attempts and decides whether to make itself claimable again.
 
-entity RotationTask {
+entity RotationAttempt {
     id: String
     target_system: TargetSystem
     cipher: Cipher
     account_identity: String
     terminate_sessions: Boolean
     status: pending | executing | succeeded | failed
-    attempt_count: Integer
     failure_reason: String?
 
     transitions status {
@@ -85,20 +95,18 @@ entity RotationTask {
         executing -> failed
         terminal: succeeded, failed
     }
-
-    has_retries: attempt_count < config.max_retry_attempts
 }
 
 -- Session termination
--- A rotation task may request that active sessions for the rotated account be
+-- A rotation attempt may request that active sessions for the rotated account be
 -- terminated. Termination is best-effort and decoupled from the rotation: the
--- rotation task succeeds once the password is rotated. When requested and
--- supported, termination runs as its own task with an independent retry
--- lifecycle so a termination failure never re-runs the rotation.
+-- attempt succeeds once the password is rotated. When requested and supported,
+-- termination runs as its own task with an independent retry lifecycle (its own
+-- counter, unlike rotation) so a termination failure never re-runs the rotation.
 
 entity SessionTermination {
     id: String
-    rotation_task: RotationTask
+    rotation_attempt: RotationAttempt
     status: queued | terminating | terminated | abandoned
     attempt_count: Integer
     failure_reason: String?
@@ -175,7 +183,7 @@ actor BitwardenServer {
 }
 
 actor Integration {
-    identified_by: task.target_system.id
+    identified_by: attempt.target_system.id
 }
 
 -- Surfaces
@@ -186,8 +194,6 @@ surface BitwardenServerSurface {
 
     provides:
         ConnectionInterrupted(connection)
-            when connection.status = connected
-        TaskDispatched()
             when connection.status = connected
 }
 
@@ -212,11 +218,11 @@ surface AuthenticationSurface {
 
 surface IntegrationSurface {
     facing _: Integration
-    context task: RotationTask where status = executing
+    context attempt: RotationAttempt where status = executing
 
     provides:
-        RotationSucceeded(task)
-        RotationAttemptFailed(task, reason)
+        RotationSucceeded(attempt)
+        RotationAttemptFailed(attempt, reason)
 }
 
 surface SessionTerminationSurface {
@@ -287,7 +293,7 @@ rule SessionExpires {
     ensures: session.status = expired
     @guidance
         -- The access token has a short lifetime. Once it lapses the daemon must
-        -- re-authenticate before it can receive or execute further tasks.
+        -- re-authenticate before it can claim or execute further attempts.
 }
 
 rule RefreshSession {
@@ -327,84 +333,94 @@ rule Reconnect {
 
 rule ConnectionEstablished {
     when: _: ServerConnection.status transitions_to connected
-    -- Server pushes any pending RotationTasks to the daemon upon each connection.
-    -- These arrive as RotationTask.created events, handled by TaskReceived.
+    -- Once connected and authenticated, the daemon pulls work: it claims jobs it is
+    -- eligible for (rotation-server.allium / ClaimRotation), prompted by the server's
+    -- availability notifications. Each claim makes the server create a RotationAttempt
+    -- for this daemon, which arrives as a RotationAttempt.created event (ReceiveAttempt).
 }
 
--- Task execution
+-- Attempt execution
 
-rule OnTaskDispatched {
-    when: TaskDispatched()
-    ensures: RotationTask.created(status: pending, attempt_count: 0)
+rule ReceiveGrant {
+    when: RotationGranted(target_system, cipher, account_identity, terminate_sessions)
+    ensures: RotationAttempt.created(
+        target_system: target_system,
+        cipher: cipher,
+        account_identity: account_identity,
+        terminate_sessions: terminate_sessions,
+        status: pending
+    )
+    @guidance
+        -- The daemon's claim succeeded (rotation-server.allium / ClaimRotation) and the
+        -- server granted it the work details for the job it claimed. The daemon creates
+        -- its own attempt from them. A retry is a fresh grant for a fresh attempt.
 }
 
-rule TaskReceived {
-    when: task: RotationTask.created
-    requires: task.status = pending
-    ensures: task.status = executing
-    ensures: ExecuteRotation(task)
+rule ReceiveAttempt {
+    when: attempt: RotationAttempt.created
+    requires: attempt.status = pending
+    ensures: attempt.status = executing
+    ensures: ExecuteRotation(attempt)
+    @guidance
+        -- The daemon executes the attempt it just created for a claimed job.
 }
 
 rule ExecuteRotation {
-    when: ExecuteRotation(task)
+    when: ExecuteRotation(attempt)
     let session = DaemonSession{status: active}
-    requires: task.status = executing
+    requires: attempt.status = executing
     requires: exists session
     -- Steps performed in order:
-    -- 1. Resolve connection credentials for task.target_system
+    -- 1. Resolve connection credentials for attempt.target_system
     --    Priority: Bitwarden Secrets Manager → environment variables → local config
-    -- 2. Generate a new password satisfying task.target_system.password_policy
-    -- 3. Update the account identified by task.account_identity in the target system
-    -- 4. Encrypt the new password with session.organization_key and write it to
-    --    task.cipher.password by submitting it to the server with the server-issued
-    --    cipher-write grant (the nonce) for this rotation. The server verifies the
-    --    grant before persisting (see rotation-server.allium / CipherWriteIntake and
-    --    AcceptCipherUpdate) and only ever stores ciphertext (ServerZeroKnowledge).
+    -- 2. Generate a new password satisfying attempt.target_system.password_policy
+    -- 3. Update the account identified by attempt.account_identity in the target system
+    -- 4. Read (GET) the cipher for this attempt, replace its password with the new
+    --    value encrypted under session.organization_key (other fields ride along as
+    --    opaque ciphertext -- not decrypted), and re-PUT the whole object to the
+    --    server, referencing the job (today's API has no partial-content write). The
+    --    daemon reads only this one cipher -- no general cipher-read scope (see
+    --    rotation-server.allium / CipherWriteIntake, ApiScopedReads). The server
+    --    authorises the write against its in-flight job for the attempt -- no separate
+    --    nonce (AcceptCipherUpdate) -- and only ever stores ciphertext (ServerZeroKnowledge).
     -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed.
     @guidance
         -- Steps 2 and 4 use the Bitwarden Rust SDK. Cipher writes require an active
         -- session: without the unlocked organization_key the daemon cannot produce
         -- valid ciphertext, so rotation cannot proceed until authentication succeeds.
-        -- The write is additionally gated by the server-issued grant, which is bound
-        -- to this cipher and short-lived; a rejected write (expired or mismatched
-        -- grant) surfaces as RotationAttemptFailed and retries under a fresh grant.
-        -- The rotation always starts from step 1 on each attempt: a fresh password is
-        -- generated and both the target system and cipher are updated together so they
-        -- remain in sync even after a previous partial failure.
+        -- A rejected write (stale or not-in-flight job) surfaces as RotationAttemptFailed;
+        -- the server then makes the job claimable again so a fresh attempt retries it.
+        -- Each attempt is independent and starts from step 1: a fresh password is
+        -- generated and both the target system and cipher are updated together, so a
+        -- previous attempt's partial failure never leaves them out of sync.
 }
 
 rule HandleRotationSucceeded {
-    when: RotationSucceeded(task)
-    requires: task.status = executing
-    ensures: task.status = succeeded
+    when: RotationSucceeded(attempt)
+    requires: attempt.status = executing
+    ensures: attempt.status = succeeded
     ensures:
-        if task.terminate_sessions and task.target_system.supports_session_termination:
-            SessionTermination.created(rotation_task: task, status: queued, attempt_count: 0)
-        if task.terminate_sessions and not task.target_system.supports_session_termination:
-            SessionTerminationUnsupported(task: task)
+        if attempt.terminate_sessions and attempt.target_system.supports_session_termination:
+            SessionTermination.created(rotation_attempt: attempt, status: queued, attempt_count: 0)
+        if attempt.terminate_sessions and not attempt.target_system.supports_session_termination:
+            SessionTerminationUnsupported(attempt: attempt)
     @guidance
         -- Session termination is best-effort and decoupled from rotation success:
-        -- the task succeeds once the password is rotated and the cipher is synced.
+        -- the attempt succeeds once the password is rotated and the cipher is synced.
         -- When termination is requested but the target system does not support it,
         -- a warning is surfaced to the Bitwarden server (via SessionTerminationUnsupported)
-        -- rather than failing the task.
+        -- rather than failing the attempt.
 }
 
-rule RetryRotation {
-    when: RotationAttemptFailed(task, reason)
-    requires: task.status = executing and task.has_retries
-    ensures: task.attempt_count = task.attempt_count + 1
-    ensures: ExecuteRotation(task)
+rule MarkAttemptFailed {
+    when: RotationAttemptFailed(attempt, reason)
+    requires: attempt.status = executing
+    ensures: attempt.status = failed
+    ensures: attempt.failure_reason = reason
     @guidance
-        -- Wait retry_base_delay * 2^(task.attempt_count - 1) before re-emitting
-        -- ExecuteRotation so that successive attempts back off exponentially.
-}
-
-rule MarkRotationFailed {
-    when: RotationAttemptFailed(task, reason)
-    requires: task.status = executing and not task.has_retries
-    ensures: task.status = failed
-    ensures: task.failure_reason = reason
+        -- The daemon does not retry. The attempt simply fails; the server observes
+        -- this and, if the job has retries left, makes the job claimable again for a
+        -- fresh attempt -- otherwise it fails the job (rotation-server.allium).
 }
 
 -- Session termination execution
@@ -419,8 +435,8 @@ rule SessionTerminationReceived {
 rule ExecuteSessionTermination {
     when: ExecuteSessionTermination(termination)
     requires: termination.status = terminating
-    -- Terminate active sessions for termination.rotation_task.account_identity on
-    -- termination.rotation_task.target_system, using the same connection credentials
+    -- Terminate active sessions for termination.rotation_attempt.account_identity on
+    -- termination.rotation_attempt.target_system, using the same connection credentials
     -- resolved for rotation (Secrets Manager → env vars → local config).
     -- Outcome reported by the SessionTerminationSurface via
     -- SessionTerminationSucceeded or SessionTerminationAttemptFailed.
@@ -465,17 +481,25 @@ invariant AtMostOneActiveSession {
 -- client-credentials grant, yielding a short-lived, refreshable, revocable session
 -- (see DaemonSession, AuthenticationSurface and the auth rules).
 -- Resolved (design): the daemon holds the organization key (from authentication) to
--- encrypt cipher writes, but each write is authorised by a server-issued, cipher-bound,
--- single-use grant with a short TTL -- the "nonce" (see rotation-server.allium /
--- CipherWriteGrant, CipherWriteIntake, AcceptCipherUpdate). Writes are therefore tightly
--- scoped to the specific dispatched cipher and window, even though the daemon holds the
--- org key, and the daemon's credential is scoped to the connect/task and PUT-cipher
--- endpoints only.
-open question "Read blast radius: holding the organization key lets the daemon decrypt the entire organization vault locally, even though the cipher-binding grant scopes its writes to one cipher. Accept this, or move to per-cipher item keys (delivered per task, grant-bound) to collapse the read scope too? Depends on Bitwarden per-item cipher keys."
+-- encrypt cipher writes, but each write is authorised against the server's own in-flight
+-- RotationJob for the rotation -- no separate nonce (see rotation-server.allium /
+-- AcceptCipherUpdate, CipherWriteIntake). A write is accepted only for a job that
+-- belongs to this daemon, is in-flight and within its window, and targets the job's
+-- cipher, so writes are tightly scoped to the specific rotated cipher and window. The
+-- read blast radius of holding the org key is contained at the API authorization layer:
+-- the daemon's credential has NO general cipher-read scope, so the server never serves it
+-- ciphertext beyond the cipher it is actively rotating (see ApiScopedReads). Since today's
+-- API has no partial-content write, rotation GETs and re-PUTs that one cipher (full
+-- object) -- the read scope is exactly the cipher being rotated.
+-- Resolved: task creation is unambiguously server-side -- the server creates a
+-- RotationAttempt when a daemon claims a job (rotation-server.allium / ClaimRotation).
+-- The daemon is no longer a task-creator; it only executes attempts the server made.
+open question "Read blast radius (residual): the organization key remains the theoretical crypto blast radius -- a daemon compromise combined with an API-authorization bypass would expose the org vault. Closing it at the crypto layer (so a stolen key alone reveals nothing beyond the managed cipher) needs per-cipher item keys (delivered per attempt, job-bound) or a write-only asymmetric scheme; both depend on Bitwarden per-item cipher keys. Deferred."
+open question "Cipher write granularity: with no partial-content API (Option A), rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the entire cipher (not just its password) and requires a read-before-write. A dedicated partial-update / rotate endpoint would remove the read and tighten write scope to the password field. A separate bearer write-token (a field on the job) would add defence in depth against an ownership-check bug. Both deferred."
 open question "Credential re-issuance: once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon?"
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
 -- Resolved in rotation-server.allium: TargetSystem instances are registered and
 -- managed server-side via TargetSystemRegistration.
--- Resolved in rotation-server.allium: tasks are tracked server-side via TaskDispatch;
--- a dispatch in flight when the connection drops is marked lost and re-dispatched
--- (as a fresh task) on reconnect.
+-- Resolved in rotation-server.allium: a rotation is tracked server-side as a RotationJob;
+-- a job in flight when the connection drops is marked lost and made due again, and a
+-- daemon re-claims it (a fresh attempt) once connected.
