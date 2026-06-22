@@ -1,0 +1,234 @@
+-- allium: 3
+-- rotation-daemon.allium
+
+-- Scope: Credential rotation daemon for Bitwarden
+-- Includes:
+--   Server connection lifecycle
+--   Rotation task lifecycle and retry behaviour
+--   Target system integrations: Entra, MSSQL, CustomScript
+--   Credential resolution for target system connections
+-- Excludes:
+--   Bitwarden server internals (external system)
+--   Bitwarden Secrets Manager internals (external system)
+--   Password generation algorithm internals
+--   Deployment and containerisation (Docker, etc.)
+
+config {
+    max_retry_attempts: Integer = 5
+    retry_base_delay: Duration = 1.second
+}
+
+-- External entities managed by Bitwarden
+
+external entity Cipher {
+    id: String
+    username: String
+    password: String
+}
+
+-- Value types
+
+value PasswordPolicy {
+    min_length: Integer
+    max_length: Integer
+    include_uppercase: Boolean
+    include_lowercase: Boolean
+    include_digits: Boolean
+    include_symbols: Boolean
+}
+
+-- Target systems
+
+entity TargetSystem {
+    id: String
+    name: String
+    kind: Entra | MSSQL | CustomScript
+    password_policy: PasswordPolicy
+    supports_session_termination: Boolean
+}
+
+variant Entra : TargetSystem {
+    tenant_id: String
+}
+
+variant MSSQL : TargetSystem {
+    host: String
+    port: Integer
+    database: String?
+}
+
+variant CustomScript : TargetSystem {
+    command: String
+}
+
+-- Rotation task
+
+entity RotationTask {
+    id: String
+    target_system: TargetSystem
+    cipher: Cipher
+    account_identity: String
+    terminate_sessions: Boolean
+    status: pending | executing | succeeded | failed
+    attempt_count: Integer
+    failure_reason: String?
+
+    transitions status {
+        pending -> executing
+        executing -> succeeded
+        executing -> failed
+        terminal: succeeded, failed
+    }
+
+    has_retries: attempt_count < config.max_retry_attempts
+}
+
+-- Server connection
+
+entity ServerConnection {
+    status: connecting | connected | disconnected
+
+    transitions status {
+        connecting -> connected
+        connecting -> disconnected
+        connected -> disconnected
+        disconnected -> connecting
+    }
+}
+
+-- Actors
+
+actor BitwardenServer {
+    identified_by: connection.endpoint
+}
+
+actor Integration {
+    identified_by: task.target_system.id
+}
+
+-- Surfaces
+
+surface BitwardenServerSurface {
+    facing _: BitwardenServer
+    context connection: ServerConnection
+
+    provides:
+        ConnectionAccepted(connection)
+            when connection.status = connecting
+        ConnectionRejected(connection)
+            when connection.status = connecting
+        ConnectionInterrupted(connection)
+            when connection.status = connected
+        TaskDispatched()
+            when connection.status = connected
+}
+
+surface IntegrationSurface {
+    facing _: Integration
+    context task: RotationTask where status = executing
+
+    provides:
+        RotationSucceeded(task)
+        RotationAttemptFailed(task, reason)
+}
+
+-- Connection lifecycle
+
+rule DaemonConnects {
+    when: _: ServerConnection.status becomes connecting
+    @guidance
+        -- Authenticate with the Bitwarden server before signalling ready.
+        -- Authentication mechanism is TBD (see open question below).
+        -- On reconnection, reuse stored credential material without re-prompting.
+}
+
+rule ServerAcceptsConnection {
+    when: ConnectionAccepted(connection)
+    requires: connection.status = connecting
+    ensures: connection.status = connected
+}
+
+rule ServerRejectsConnection {
+    when: ConnectionRejected(connection)
+    requires: connection.status = connecting
+    ensures: connection.status = disconnected
+}
+
+rule ServerInterruptsConnection {
+    when: ConnectionInterrupted(connection)
+    requires: connection.status = connected
+    ensures: connection.status = disconnected
+}
+
+rule Reconnect {
+    when: connection: ServerConnection.status transitions_to disconnected
+    requires: connection.status = disconnected
+    ensures: connection.status = connecting
+    @guidance
+        -- Reconnection attempts use exponential backoff.
+}
+
+rule ConnectionEstablished {
+    when: _: ServerConnection.status transitions_to connected
+    -- Server pushes any pending RotationTasks to the daemon upon each connection.
+    -- These arrive as RotationTask.created events, handled by TaskReceived.
+}
+
+-- Task execution
+
+rule OnTaskDispatched {
+    when: TaskDispatched()
+    ensures: RotationTask.created(status: pending, attempt_count: 0)
+}
+
+rule TaskReceived {
+    when: task: RotationTask.created
+    requires: task.status = pending
+    ensures: task.status = executing
+    ensures: ExecuteRotation(task)
+}
+
+rule ExecuteRotation {
+    when: ExecuteRotation(task)
+    requires: task.status = executing
+    -- Steps performed in order:
+    -- 1. Resolve connection credentials for task.target_system
+    --    Priority: Bitwarden Secrets Manager → environment variables → local config
+    -- 2. Generate a new password satisfying task.target_system.password_policy
+    -- 3. Update the account identified by task.account_identity in the target system
+    -- 4. Update task.cipher.password with the new password and sync to Bitwarden
+    -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed.
+    @guidance
+        -- Steps 2 and 4 use the Bitwarden Rust SDK.
+        -- The rotation always starts from step 1 on each attempt: a fresh password is
+        -- generated and both the target system and cipher are updated together so they
+        -- remain in sync even after a previous partial failure.
+}
+
+rule HandleRotationSucceeded {
+    when: RotationSucceeded(task)
+    requires: task.status = executing
+    ensures: task.status = succeeded
+}
+
+rule RetryRotation {
+    when: RotationAttemptFailed(task, reason)
+    requires: task.status = executing and task.has_retries
+    ensures: task.attempt_count = task.attempt_count + 1
+    ensures: ExecuteRotation(task)
+    @guidance
+        -- Wait retry_base_delay * 2^(task.attempt_count - 1) before re-emitting
+        -- ExecuteRotation so that successive attempts back off exponentially.
+}
+
+rule MarkRotationFailed {
+    when: RotationAttemptFailed(task, reason)
+    requires: task.status = executing and not task.has_retries
+    ensures: task.status = failed
+    ensures: task.failure_reason = reason
+}
+
+open question "Daemon authentication: possibly a combination of OAuth client_id/secret and API key, TBD."
+open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
+open question "How are TargetSystem instances registered and managed on the Bitwarden server?"
+open question "Should a task mid-execution when the connection dropped be re-delivered and retried from scratch on reconnect, or tracked server-side as already in-progress?"
