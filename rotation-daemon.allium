@@ -126,6 +126,48 @@ entity ServerConnection {
     }
 }
 
+-- Authentication
+-- The daemon authenticates with the Bitwarden server using a provisioned access
+-- token: an OAuth2 client-credentials grant (client_id + client_secret) that the
+-- server exchanges for a short-lived bearer access token. The provisioned token
+-- also carries a local encryption_key, never transmitted, which the daemon uses to
+-- decrypt the organization key the server returns. The daemon needs that key to
+-- encrypt password updates into organization vault ciphers, and the server never
+-- holds the plaintext key or password (zero-knowledge). This borrows Secrets
+-- Manager's token and zero-knowledge key-delivery pattern, but vault-cipher access
+-- is a broader authorization than an SM machine account has -- see the open
+-- question on the vault key grant.
+
+external entity DaemonCredential {
+    client_id: String
+    client_secret: String
+    encryption_key: String
+}
+
+-- The daemon operates with a single provisioned credential.
+given {
+    credential: DaemonCredential
+}
+
+entity DaemonSession {
+    id: String
+    connection: ServerConnection
+    credential: DaemonCredential
+    status: authenticating | active | expired | revoked
+    access_token: String when status = active
+    expires_at: Timestamp when status = active
+    organization_key: String when status = active
+
+    transitions status {
+        authenticating -> active
+        authenticating -> revoked
+        active -> expired
+        active -> revoked
+        expired -> authenticating
+        terminal: revoked
+    }
+}
+
 -- Actors
 
 actor BitwardenServer {
@@ -143,14 +185,29 @@ surface BitwardenServerSurface {
     context connection: ServerConnection
 
     provides:
-        ConnectionAccepted(connection)
-            when connection.status = connecting
-        ConnectionRejected(connection)
-            when connection.status = connecting
         ConnectionInterrupted(connection)
             when connection.status = connected
         TaskDispatched()
             when connection.status = connected
+}
+
+surface AuthenticationSurface {
+    facing _: BitwardenServer
+    context session: DaemonSession
+
+    provides:
+        AuthenticationSucceeded(session, access_token, expires_at, organization_key)
+            when session.status = authenticating
+        AuthenticationRejected(session)
+            when session.status = authenticating
+        SessionRevoked(session)
+            when session.status = active
+
+    @guarantee ServerZeroKnowledge
+        -- The organization key crosses the server boundary only in encrypted form;
+        -- the daemon decrypts it locally with credential.encryption_key, which is
+        -- never transmitted. The server never holds the plaintext organization key,
+        -- nor any plaintext password the daemon later writes to a cipher.
 }
 
 surface IntegrationSurface {
@@ -174,23 +231,84 @@ surface SessionTerminationSurface {
 -- Connection lifecycle
 
 rule DaemonConnects {
-    when: _: ServerConnection.status becomes connecting
+    when: connection: ServerConnection.status becomes connecting
+    ensures: DaemonSession.created(
+        connection: connection,
+        credential: credential,
+        status: authenticating
+    )
     @guidance
-        -- Authenticate with the Bitwarden server before signalling ready.
-        -- Authentication mechanism is TBD (see open question below).
-        -- On reconnection, reuse stored credential material without re-prompting.
+        -- Entering the authenticating state represents presenting the provisioned
+        -- credential (client_id + client_secret) to the server. The connection is
+        -- signalled ready only once authentication succeeds. On reconnection the
+        -- daemon reuses the stored credential without re-prompting.
 }
 
-rule ServerAcceptsConnection {
-    when: ConnectionAccepted(connection)
+rule HandleAuthenticationSucceeded {
+    when: AuthenticationSucceeded(session, access_token, expires_at, organization_key)
+    requires: session.status = authenticating
+    requires: session.connection.status = connecting
+    ensures: session.status = active
+    ensures: session.access_token = access_token
+    ensures: session.expires_at = expires_at
+    ensures: session.organization_key = organization_key
+    ensures: ConnectionAuthenticated(connection: session.connection)
+    @guidance
+        -- The server returns a short-lived access token and the organization key in
+        -- encrypted form. organization_key here is the daemon-local result of
+        -- decrypting that payload with credential.encryption_key (see the
+        -- AuthenticationSurface ServerZeroKnowledge guarantee). The connection is
+        -- signalled ready only once authentication succeeds (see OpenConnection).
+}
+
+rule HandleAuthenticationRejected {
+    when: AuthenticationRejected(session)
+    requires: session.status = authenticating
+    requires: session.connection.status = connecting
+    ensures: session.status = revoked
+    ensures: ConnectionRefused(connection: session.connection)
+}
+
+rule OpenConnection {
+    when: ConnectionAuthenticated(connection)
     requires: connection.status = connecting
     ensures: connection.status = connected
 }
 
-rule ServerRejectsConnection {
-    when: ConnectionRejected(connection)
+rule RefuseConnection {
+    when: ConnectionRefused(connection)
     requires: connection.status = connecting
     ensures: connection.status = disconnected
+}
+
+rule SessionExpires {
+    when: session: DaemonSession.expires_at <= now
+    requires: session.status = active
+    ensures: session.status = expired
+    @guidance
+        -- The access token has a short lifetime. Once it lapses the daemon must
+        -- re-authenticate before it can receive or execute further tasks.
+}
+
+rule RefreshSession {
+    when: session: DaemonSession.status transitions_to expired
+    requires: session.status = expired
+    ensures: session.status = authenticating
+    @guidance
+        -- Re-present the provisioned credential to obtain a fresh access token; the
+        -- organization key is re-derived from the new authentication response.
+}
+
+rule HandleSessionRevoked {
+    when: SessionRevoked(session)
+    requires: session.status = active
+    ensures: session.status = revoked
+    @guidance
+        -- The server can revoke a daemon's credential (e.g. an admin revokes the
+        -- daemon, see rotation-server.allium / RevokeDaemon). The session becomes
+        -- revoked; the server closes the underlying connection separately (see
+        -- ServerInterruptsConnection). The daemon cannot reconnect until issued a
+        -- new credential.
 }
 
 rule ServerInterruptsConnection {
@@ -229,16 +347,27 @@ rule TaskReceived {
 
 rule ExecuteRotation {
     when: ExecuteRotation(task)
+    let session = DaemonSession{status: active}
     requires: task.status = executing
+    requires: exists session
     -- Steps performed in order:
     -- 1. Resolve connection credentials for task.target_system
     --    Priority: Bitwarden Secrets Manager → environment variables → local config
     -- 2. Generate a new password satisfying task.target_system.password_policy
     -- 3. Update the account identified by task.account_identity in the target system
-    -- 4. Update task.cipher.password with the new password and sync to Bitwarden
+    -- 4. Encrypt the new password with session.organization_key and write it to
+    --    task.cipher.password by submitting it to the server with the server-issued
+    --    cipher-write grant (the nonce) for this rotation. The server verifies the
+    --    grant before persisting (see rotation-server.allium / CipherWriteIntake and
+    --    AcceptCipherUpdate) and only ever stores ciphertext (ServerZeroKnowledge).
     -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed.
     @guidance
-        -- Steps 2 and 4 use the Bitwarden Rust SDK.
+        -- Steps 2 and 4 use the Bitwarden Rust SDK. Cipher writes require an active
+        -- session: without the unlocked organization_key the daemon cannot produce
+        -- valid ciphertext, so rotation cannot proceed until authentication succeeds.
+        -- The write is additionally gated by the server-issued grant, which is bound
+        -- to this cipher and short-lived; a rejected write (expired or mismatched
+        -- grant) surfaces as RotationAttemptFailed and retries under a fresh grant.
         -- The rotation always starts from step 1 on each attempt: a fresh password is
         -- generated and both the target system and cipher are updated together so they
         -- remain in sync even after a previous partial failure.
@@ -324,7 +453,26 @@ rule MarkSessionTerminationAbandoned {
         -- already succeeded. The failure is surfaced to the Bitwarden server.
 }
 
-open question "Daemon authentication: possibly a combination of OAuth client_id/secret and API key, TBD."
+-- Invariants
+
+invariant AtMostOneActiveSession {
+    for a in DaemonSessions:
+        for b in DaemonSessions:
+            (a != b and a.status = active) implies b.status != active
+}
+
+-- Resolved: the daemon authenticates with a provisioned access token via an OAuth2
+-- client-credentials grant, yielding a short-lived, refreshable, revocable session
+-- (see DaemonSession, AuthenticationSurface and the auth rules).
+-- Resolved (design): the daemon holds the organization key (from authentication) to
+-- encrypt cipher writes, but each write is authorised by a server-issued, cipher-bound,
+-- single-use grant with a short TTL -- the "nonce" (see rotation-server.allium /
+-- CipherWriteGrant, CipherWriteIntake, AcceptCipherUpdate). Writes are therefore tightly
+-- scoped to the specific dispatched cipher and window, even though the daemon holds the
+-- org key, and the daemon's credential is scoped to the connect/task and PUT-cipher
+-- endpoints only.
+open question "Read blast radius: holding the organization key lets the daemon decrypt the entire organization vault locally, even though the cipher-binding grant scopes its writes to one cipher. Accept this, or move to per-cipher item keys (delivered per task, grant-bound) to collapse the read scope too? Depends on Bitwarden per-item cipher keys."
+open question "Credential re-issuance: once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon?"
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
 -- Resolved in rotation-server.allium: TargetSystem instances are registered and
 -- managed server-side via TargetSystemRegistration.

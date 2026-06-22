@@ -17,7 +17,8 @@ use "./rotation-daemon.allium" as daemon
 --   Audit emission for every rotation attempt and outcome (Goal 4)
 -- Excludes:
 --   Daemon execution of rotations (governed by rotation-daemon.allium)
---   Daemon authentication and connection establishment (open question)
+--   The daemon authentication handshake and session lifecycle (modelled in
+--     rotation-daemon.allium); this spec covers only daemon registration/revocation
 --   Bitwarden cipher/Secrets Manager internals (external systems)
 --   Audit-log persistence and WORM/tamper-evidence: this spec emits the audit
 --     events; durable, append-only storage is the existing Phase 1 audit log's
@@ -33,6 +34,10 @@ use "./rotation-daemon.allium" as daemon
 
 config {
     failure_retry_delay: Duration = 1.hour
+    -- Lifetime of the cipher-write grant (the nonce) issued with each dispatch.
+    -- Must comfortably exceed one rotation attempt (target update + cipher write),
+    -- since the cipher is written only after the target system has been rotated.
+    cipher_write_grant_ttl: Duration = 15.minutes
 }
 
 -- Parties
@@ -49,6 +54,13 @@ actor AccessEventSource {
     identified_by: cipher.id
 }
 
+-- The rotation daemon, acting back on the server to write a rotated password to a
+-- cipher. Its credential is scoped to the connect/task endpoints and PUT ciphers
+-- only, and every cipher write must present a valid server-issued grant (the nonce).
+actor RotationDaemon {
+    identified_by: grant.id
+}
+
 -- Entities
 
 entity TargetSystemRegistration {
@@ -62,9 +74,29 @@ entity TargetSystemRegistration {
     }
 }
 
+-- A registered rotation daemon identity. The admin registers a daemon, the server
+-- issues its credential (an OAuth2 client_id + client_secret plus a local
+-- encryption key, delivered out of band; only the client_id is retained here), and
+-- the daemon authenticates with it (see rotation-daemon.allium / DaemonSession).
+-- Revoking a registration invalidates the credential and the daemon's session.
+-- Status literals are deliberately distinct from TargetSystemRegistration's
+-- (enrolled, not active) so untyped trigger-param inference stays unambiguous.
+entity DaemonRegistration {
+    id: String
+    name: String
+    client_id: String
+    status: enrolled | revoked
+
+    transitions status {
+        enrolled -> revoked
+        terminal: revoked
+    }
+}
+
 -- A rotation configuration links a cipher to a registered target system and
--- carries the rotation settings and schedule. There is one configuration per
--- (cipher, target_system) pair.
+-- carries the rotation settings and schedule. A cipher has at most one rotation
+-- configuration (which names its target system); see OneConfigPerCipher. The
+-- cipher therefore uniquely identifies the configuration to rotate.
 --
 -- SM seam (Phase 1 non-goal): a future Secrets Manager configuration would point
 -- at an SM secret rather than a cipher. The `cipher` field here and
@@ -122,6 +154,52 @@ entity TaskDispatch {
     }
 }
 
+-- The capability ("nonce") that authorises a single cipher write. Issued with each
+-- dispatch, bound to the one cipher being rotated, short-lived and single-use. The
+-- grant's identity is the unguessable token the daemon presents; the server accepts
+-- a cipher write only against an issued, unexpired grant whose cipher matches (see
+-- AcceptCipherUpdate). This scopes the daemon's write authority to exactly the
+-- cipher it was dispatched, even though it holds the organization key to encrypt.
+entity CipherWriteGrant {
+    id: String
+    dispatch: TaskDispatch
+    cipher: daemon/Cipher
+    created_at: Timestamp
+    expires_at: Timestamp
+    status: issued | consumed | expired
+
+    transitions status {
+        issued -> consumed
+        issued -> expired
+        terminal: consumed, expired
+    }
+}
+
+-- Daemon registration
+
+rule RegisterDaemon {
+    when: RegisterDaemon(name, client_id)
+    requires: not exists DaemonRegistration{client_id: client_id}
+    ensures: DaemonRegistration.created(name: name, client_id: client_id, status: enrolled)
+    @guidance
+        -- The server issues the daemon's access token (client_id + client_secret and
+        -- a local encryption key) out of band. The secret and encryption key are not
+        -- retained server-side in recoverable form; only the client_id is kept, for
+        -- identification (zero-knowledge, see rotation-daemon.allium).
+}
+
+rule RevokeDaemon {
+    when: RevokeDaemon(registration)
+    requires: registration.status = enrolled
+    ensures: registration.status = revoked
+    @guidance
+        -- Revoking a daemon invalidates its credential. The next time the daemon
+        -- interacts its session is revoked (rotation-daemon.allium /
+        -- HandleSessionRevoked) and its connection closed; it cannot authenticate
+        -- again until issued a new credential (see the re-issuance open question in
+        -- rotation-daemon.allium).
+}
+
 -- Target system registration
 
 rule RegisterTargetSystem {
@@ -152,7 +230,7 @@ rule CreateRotationConfig {
     let registration = TargetSystemRegistration{target_system: target_system}
     requires: exists registration
     requires: registration.status = active
-    requires: not exists RotationConfig{cipher: cipher, target_system: target_system}
+    requires: not exists RotationConfig{cipher: cipher}
     -- An automatic configuration can only target a system the daemon can rotate;
     -- a system without an automated integration must be managed manually (Goal 3).
     requires: mode = manual or target_system.supports_automatic_rotation
@@ -209,21 +287,24 @@ rule TriggerRotationNow {
 
 rule RotateOnAccessEnd {
     when: AccessGrantEnded(cipher)
-    for rotation_config in RotationConfigs where cipher = cipher
-                                             and enabled
-                                             and mode = automatic
-                                             and rotate_on_access_end:
-        ensures: DispatchRotation(rotation_config: rotation_config, source: access_end)
+    let rotation_config = RotationConfig{cipher: cipher}
+    requires: exists rotation_config
+    requires: rotation_config.enabled
+    requires: rotation_config.mode = automatic
+    requires: rotation_config.rotate_on_access_end
+    ensures: DispatchRotation(rotation_config: rotation_config, source: access_end)
     @guidance
         -- Rotation on access events (Goal 2). When an upstream access-control
         -- system signals that a grant over a managed credential has ended — a PAM
-        -- lease expiring or being revoked, an AAP grant ending — every automatic
-        -- configuration for that cipher that opted in is dispatched. The signal is
-        -- intentionally abstract (AccessEventIntake): rotation depends on the
-        -- event, not on any particular leasing spec, so PAM, AAP leasing or a
-        -- future Secrets Manager can all emit it. Routing through DispatchRotation
-        -- means PerformDispatch applies the usual guards, so an ineligible config
-        -- (disabled, in-flight, deregistered) is silently skipped.
+        -- lease expiring or being revoked, an AAP grant ending — the cipher's
+        -- single rotation configuration (OneConfigPerCipher) is dispatched, if it
+        -- is automatic and opted in. The cipher alone resolves the configuration,
+        -- so the signal carries no account identity. The signal is intentionally
+        -- abstract (AccessEventIntake): rotation depends on the event, not on any
+        -- particular leasing spec, so PAM, AAP leasing or a future Secrets Manager
+        -- can all emit it. Routing through DispatchRotation means PerformDispatch
+        -- re-checks the usual guards, so an in-flight or deregistered config is
+        -- safely skipped.
 }
 
 rule RedispatchOnReconnect {
@@ -328,6 +409,70 @@ rule MarkDispatchLost {
     ensures: RotationAudited(rotation_config: dispatch.rotation_config, outcome: lost, source: dispatch.source)
 }
 
+rule InvalidateGrantOnLoss {
+    when: dispatch: TaskDispatch.status transitions_to lost
+    let grant = CipherWriteGrant{dispatch: dispatch}
+    requires: exists grant
+    requires: grant.status = issued
+    ensures: grant.status = expired
+    @guidance
+        -- A lost dispatch's grant is invalidated immediately, so a stale write from
+        -- the interrupted attempt is rejected even if its TTL has not yet elapsed.
+        -- The re-dispatch (RedispatchOnReconnect) issues a fresh grant.
+}
+
+-- Cipher write authorisation (the nonce)
+--
+-- The daemon writes the rotated, encrypted password back to a cipher by presenting
+-- the grant issued with its dispatch (CipherWriteIntake). The server verifies the
+-- grant is issued, unexpired and bound to the submitted cipher, then persists the
+-- ciphertext and consumes the grant. An invalid grant is refused and audited.
+
+rule IssueCipherWriteGrant {
+    when: dispatch: TaskDispatch.created
+    requires: dispatch.status = dispatched
+    ensures: CipherWriteGrant.created(
+        dispatch: dispatch,
+        cipher: dispatch.rotation_config.cipher,
+        created_at: now,
+        expires_at: now + config.cipher_write_grant_ttl,
+        status: issued
+    )
+    @guidance
+        -- Each dispatch carries exactly one cipher-write grant, minted when the
+        -- dispatch is created and delivered to the daemon with the task.
+}
+
+rule CipherWriteGrantExpires {
+    when: grant: CipherWriteGrant.expires_at <= now
+    requires: grant.status = issued
+    ensures: grant.status = expired
+}
+
+rule AcceptCipherUpdate {
+    when: SubmitCipherUpdate(grant, cipher, new_password)
+    requires: grant.status = issued
+    requires: grant.expires_at > now
+    requires: grant.cipher = cipher
+    ensures: cipher.password = new_password
+    ensures: grant.status = consumed
+    @guidance
+        -- new_password is ciphertext the daemon encrypted with the organization key;
+        -- the server persists it without decrypting (zero-knowledge). Consuming the
+        -- grant makes the write single-use.
+}
+
+rule RejectCipherUpdate {
+    when: SubmitCipherUpdate(grant, cipher, new_password)
+    requires: grant.status != issued or grant.expires_at <= now or grant.cipher != cipher
+    ensures: RotationAudited(rotation_config: grant.dispatch.rotation_config, outcome: write_rejected)
+    @guidance
+        -- The write is refused: the grant is expired, already consumed, or does not
+        -- bind to the submitted cipher. The daemon surfaces this as a failed attempt
+        -- (rotation-daemon.allium / RotationAttemptFailed), which retries the whole
+        -- rotation under a fresh grant.
+}
+
 -- Manual rotation fallback (Goal 3)
 
 rule RecordManualRotation {
@@ -348,8 +493,9 @@ rule RecordManualRotation {
 -- Audit
 --
 -- RotationAudited is emitted on every rotation attempt and outcome — a dispatch
--- (the attempt), its success, failure or loss, and a recorded manual rotation
--- (Goal 4). It is a pure sink: no rule chains from it. Durable, append-only,
+-- (the attempt), its success, failure or loss, a refused cipher write
+-- (write_rejected), and a recorded manual rotation (Goal 4). It is a pure sink: no
+-- rule chains from it. Durable, append-only,
 -- tamper-evident (WORM) storage is the existing Phase 1 audit log's job and is out
 -- of scope here; this spec models the event, not its persistence (mirroring
 -- pam.allium's LeaseActivationAudited). `source` carries why the rotation fired
@@ -366,10 +512,13 @@ invariant OneRegistrationPerTargetSystem {
             a != b implies a.target_system != b.target_system
 }
 
-invariant OneConfigPerCipherTarget {
+invariant OneConfigPerCipher {
+    -- A cipher is under at most one rotation configuration. The configuration names
+    -- the target system, so the cipher uniquely identifies what to rotate and where
+    -- (relied on by RotateOnAccessEnd and the RotationConfig{cipher} lookup).
     for a in RotationConfigs:
         for b in RotationConfigs:
-            a != b implies (a.cipher != b.cipher or a.target_system != b.target_system)
+            a != b implies a.cipher != b.cipher
 }
 
 invariant AtMostOneInFlightDispatchPerConfig {
@@ -398,8 +547,23 @@ surface RotationAdministration {
     facing _: Administrator
 
     provides:
+        RegisterDaemon(name, client_id)
         RegisterTargetSystem(target_system)
         CreateRotationConfig(cipher, target_system, account_identity, terminate_sessions, rotation_interval, mode, rotate_on_access_end)
+}
+
+surface DaemonRegistrationView {
+    facing _: Administrator
+    context registration: DaemonRegistration
+
+    exposes:
+        registration.name
+        registration.client_id
+        registration.status
+
+    provides:
+        RevokeDaemon(registration)
+            when registration.status = enrolled
 }
 
 surface TargetSystemRegistrationView {
@@ -460,15 +624,35 @@ surface AccessEventIntake {
         AccessGrantEnded(cipher)
 }
 
+surface CipherWriteIntake {
+    -- The daemon writes a rotated, encrypted password back to a cipher, presenting
+    -- the grant (nonce) the server issued with its dispatch. This is the only cipher
+    -- operation the daemon's scoped credential permits.
+    facing _: RotationDaemon
+    context grant: CipherWriteGrant
+
+    provides:
+        SubmitCipherUpdate(grant, cipher, new_password)
+
+    @guarantee NonceBoundWrite
+        -- A cipher write is accepted only against an issued, unexpired grant whose
+        -- cipher matches the submission, and the grant is consumed on use (single
+        -- write). new_password is ciphertext encrypted with the organization key; the
+        -- server stores it without decrypting (zero-knowledge).
+}
+
 -- Open questions
 
-open question "Daemon authentication and connection establishment: how does a daemon authenticate and register its connection with the server? (Carried over from rotation-daemon.allium.)"
+-- Resolved: a daemon is registered server-side (DaemonRegistration) and authenticates
+-- with a provisioned access token via an OAuth2 client-credentials grant; the session
+-- lifecycle (refresh, revoke) is modelled in rotation-daemon.allium. The vault key
+-- grant the daemon needs to write ciphers remains an open question there.
 open question "Multi-daemon routing: when more than one daemon is connected, how does the server choose which daemon receives a dispatch, and is recovery scoped per-daemon rather than to all in-flight dispatches?"
 open question "Reconcile task creation: both the daemon's OnTaskDispatched and the server's PerformDispatch model RotationTask creation. Confirm the server is authoritative and adjust the daemon's dispatch entry point accordingly."
 open question "Failure handling beyond rescheduling: should repeated rotation failures raise an alert, escalate, or disable the configuration after a threshold?"
 open question "Should disabling a target system or a configuration cancel in-flight dispatches, or only stop new ones?"
 open question "Manual obligation escalation: beyond surfacing awaiting_manual_rotation, should a manual configuration whose obligation stays unmet past a threshold escalate — notify, flag severity, or raise an alert?"
-open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...), and should the signal carry account_identity so it can disambiguate when one cipher backs configurations on multiple target systems? Today every opted-in automatic config for the cipher is rotated."
+open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...)? The signal-shape question is resolved — it carries only the cipher, which uniquely resolves the configuration to rotate (OneConfigPerCipher), so no account_identity is needed — but the concrete set of emitters and how they register against AccessEventIntake is still open."
 open question "On-demand and access-triggered dispatches record a source on the TaskDispatch but not the triggering admin (only manual_recorded carries an actor). Should the audit attribute the on-demand actor end to end?"
 open question "Mode switching: can an admin move a configuration between automatic and manual after creation, and if so what becomes of its schedule and any in-flight dispatch? (ManualConfigNeverDispatched assumes mode is fixed at creation.)"
 open question "Secrets Manager support (Phase 1 non-goal): a future configuration would point at an SM secret rather than a daemon/Cipher. Confirm the dispatch, recovery, scheduling and audit machinery here carries an SM rotation task unchanged, and decide whether to generalise the cipher seam or add a parallel SM configuration."
