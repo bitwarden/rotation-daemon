@@ -247,8 +247,8 @@ tr:nth-child(even) td { background: #fafbfc; }
   <a href="#s-state-machines">4. State Machines</a>
   <a href="#sm-connection" class="toc-h3">Connection</a>
   <a href="#sm-session" class="toc-h3">Daemon Session</a>
-  <a href="#sm-task" class="toc-h3">Rotation Task</a>
-  <a href="#sm-dispatch" class="toc-h3">Task Dispatch</a>
+  <a href="#sm-task" class="toc-h3">Rotation Attempt</a>
+  <a href="#sm-dispatch" class="toc-h3">Rotation Job</a>
   <a href="#sm-daemon-connection" class="toc-h3">Daemon Connection</a>
   <a href="#sm-termination" class="toc-h3">Session Termination</a>
   <a href="#s-auth">5. Connection &amp; Auth</a>
@@ -257,11 +257,10 @@ tr:nth-child(even) td { background: #fafbfc; }
   <a href="#s-write-auth">8. Cipher Write Auth</a>
   <a href="#s-termination">9. Session Termination</a>
   <a href="#s-recovery">10. Recovery</a>
-  <a href="#s-fleet">11. Fleet Spreading</a>
-  <a href="#s-manual">12. Manual Fallback</a>
-  <a href="#s-audit">13. Audit Trail</a>
-  <a href="#s-invariants">14. Invariants</a>
-  <a href="#s-openqs">15. Open Questions</a>
+  <a href="#s-manual">11. Manual Fallback</a>
+  <a href="#s-audit">12. Audit Trail</a>
+  <a href="#s-invariants">13. Invariants</a>
+  <a href="#s-openqs">14. Open Questions</a>
 </nav>
 
 <main id="content">
@@ -271,10 +270,10 @@ tr:nth-child(even) td { background: #fafbfc; }
 
 <div class="stats-strip">
   <div class="stat"><span class="stat-val">2</span><span class="stat-lbl">spec files</span></div>
-  <div class="stat"><span class="stat-val">49</span><span class="stat-lbl">rules</span></div>
-  <div class="stat"><span class="stat-val">12</span><span class="stat-lbl">surfaces</span></div>
-  <div class="stat"><span class="stat-val">7</span><span class="stat-lbl">invariants</span></div>
-  <div class="stat"><span class="stat-val">14</span><span class="stat-lbl">open questions</span></div>
+  <div class="stat"><span class="stat-val">50</span><span class="stat-lbl">rules</span></div>
+  <div class="stat"><span class="stat-val">14</span><span class="stat-lbl">surfaces</span></div>
+  <div class="stat"><span class="stat-val">8</span><span class="stat-lbl">invariants</span></div>
+  <div class="stat"><span class="stat-val">15</span><span class="stat-lbl">open questions</span></div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════ -->
@@ -287,8 +286,8 @@ tr:nth-child(even) td { background: #fafbfc; }
 <table>
   <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
   <tbody>
-    <tr><td><code>rotation-daemon.allium</code></td><td>The daemon process: connects to the Bitwarden server, receives rotation tasks, executes them against target systems, writes the new password back to the vault.</td></tr>
-    <tr><td><code>rotation-server.allium</code></td><td>The Bitwarden server side: registers target systems and daemon identities, manages rotation configurations and schedules, dispatches tasks, tracks execution, handles recovery, and emits the audit trail.</td></tr>
+    <tr><td><code>rotation-daemon.allium</code></td><td>The daemon process: connects to the Bitwarden server, claims rotation jobs, executes them against target systems, writes the new password back to the vault.</td></tr>
+    <tr><td><code>rotation-server.allium</code></td><td>The Bitwarden server side: registers target systems and daemon identities, manages rotation configurations and schedules, creates rotation jobs, orchestrates retries, handles recovery, and emits the audit trail.</td></tr>
   </tbody>
 </table>
 
@@ -300,10 +299,44 @@ tr:nth-child(even) td { background: #fafbfc; }
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-architecture"><span class="section-num">2</span>Architecture</h2>
 
-<p>Rather than one diagram with all relations at once, the two flows below each tell one story: how a rotation gets triggered and routed to a daemon, and what the daemon does to execute it.</p>
+<p>Rather than one diagram with all relations at once, the three flows below each tell one story: how an administrator configures rotation, how a due rotation becomes a job an eligible daemon claims, and what the daemon does to execute it and write the result back.</p>
 
 <div class="diagram">
-  <div class="diagram-title">Flow 1 — Rotation trigger &amp; dispatch</div>
+  <div class="diagram-title">Flow 1 — Configuration (one-time setup)</div>
+  <div class="mermaid">
+flowchart TB
+  Admin(["👤 Administrator"])
+  Cipher[("🗄 Vault Cipher")]
+
+  subgraph Server["Bitwarden Server"]
+    direction TB
+    TSR["TargetSystemRegistration\n——\nactive / disabled"]
+    DReg["DaemonRegistration\n——\nclient_id · enrolled"]
+    DC["DaemonConnection\n——\nliveness · starts disconnected"]
+    DTA["DaemonTargetAssignment\n——\ndaemon ↔ target (eligibility)"]
+    RC["RotationConfig\n——\ncipher ↔ target\nmode · settings (schedule + access-end)"]
+  end
+
+  Admin -->|"RegisterTargetSystem"| TSR
+  Admin -->|"RegisterDaemon"| DReg
+  DReg  -.->|"InitDaemonConnection"| DC
+  Admin -->|"AssignDaemonToTarget"| DTA
+  DTA   -.->|"daemon"| DReg
+  DTA   -.->|"target"| TSR
+  Admin -->|"CreateRotationConfig"| RC
+  RC    -.->|"target"| TSR
+  RC    -.->|"cipher"| Cipher
+
+  style RC   fill:#e7f0fd,stroke:#175DDC,stroke-width:1.5px
+  style TSR  fill:#fff8e6,stroke:#a05900,stroke-width:1px
+  style DReg fill:#f3f0fb,stroke:#5e35b1,stroke-width:1px
+  style DC   fill:#f3f0fb,stroke:#5e35b1,stroke-width:1px
+  style DTA  fill:#f3f0fb,stroke:#5e35b1,stroke-width:1px
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">Flow 2 — Rotation job creation &amp; claiming</div>
   <div class="mermaid">
 flowchart TB
   Admin(["👤 Administrator"])
@@ -312,56 +345,56 @@ flowchart TB
 
   subgraph Server["Bitwarden Server"]
     direction TB
-    RC["RotationConfig\n——\nlinks cipher ↔ target\nschedule · mode · triggers"]
+    RC["RotationConfig\n——\nenabled · automatic\nnext_rotation_at"]
 
-    subgraph Routing["Routing eligibility"]
+    subgraph Routing["Claim eligibility"]
       direction LR
-      DR["DaemonRegistration\n+ TargetAssignment"]
+      DR["DaemonRegistration\n+ assignment"]
       DC["DaemonConnection\n(liveness)"]
     end
 
-    TD["TaskDispatch\n——\nchosen daemon · dispatched_at\nwrite window · deadline"]
+    RJ["RotationJob\n——\nstatus: pending → claimed\nattempt_count · deadline"]
   end
 
   Daemon["⚙ Rotation Daemon"]
 
-  Admin  -->|"on-demand trigger"| RC
+  Admin  -->|"TriggerRotationNow"| RC
   Sched  -->|"RotationDue"| RC
   PAM    -->|"AccessGrantEnded"| RC
-  Admin  -->|"register + assign\nto targets"| DR
 
-  DR & DC -.->|"eligible_daemons"| RC
-  RC     -->|"PerformDispatch\n→ chosen daemon"| TD
-  TD     -->|"push RotationTask"| Daemon
+  RC     -->|"OfferRotation\n→ RotationJob (pending)"| RJ
+  DR & DC -.->|"claim eligibility"| RJ
+  RJ     -->|"notify eligible daemons"| Daemon
+  Daemon -->|"ClaimRotation\n→ RotationGranted"| RJ
 
   style RC  fill:#e7f0fd,stroke:#175DDC,stroke-width:1.5px
-  style TD  fill:#e8f5ed,stroke:#1a7d3b,stroke-width:1.5px
+  style RJ  fill:#e8f5ed,stroke:#1a7d3b,stroke-width:1.5px
   style DR  fill:#f3f0fb,stroke:#5e35b1,stroke-width:1px
   style DC  fill:#f3f0fb,stroke:#5e35b1,stroke-width:1px
   </div>
 </div>
 
 <div class="diagram">
-  <div class="diagram-title">Flow 2 — Task execution &amp; cipher write</div>
+  <div class="diagram-title">Flow 3 — Attempt execution &amp; cipher write</div>
   <div class="mermaid">
 flowchart LR
-  Daemon["⚙ Rotation Daemon\nDaemonSession · org key\nRotationTask"]
+  Daemon["⚙ Rotation Daemon\nDaemonSession · org key\nRotationAttempt"]
   Target["🎯 Target System\nEntra · MSSQL · CustomScript"]
 
   subgraph Server["Bitwarden Server"]
-    CWI{{"CipherWriteIntake\n(DispatchBoundWrite policy)"}}
-    TD["TaskDispatch\n——\nwrite authority:\nowner · in-flight · 15-min window"]
+    CWI{{"CipherWriteIntake\n(JobBoundWrite policy)"}}
+    RJ["RotationJob\n——\nwrite authority:\njob.daemon = writer\nstatus = claimed"]
     Vault[("🗄 Vault Cipher\nciphertext only")]
   end
 
   Daemon -->|"1 · rotate account"| Target
   Daemon -->|"2 · GET cipher\n(ApiScopedReads)"| Vault
-  Daemon -->|"3 · SubmitCipherUpdate\ntask + ciphertext"| CWI
-  CWI    -.->|"verify:\ndispatch.daemon = writer\nin-flight · within window"| TD
+  Daemon -->|"3 · SubmitCipherUpdate\nattempt + ciphertext"| CWI
+  CWI    -.->|"verify:\njob.daemon = writer · claimed"| RJ
   CWI    -->|"persist"| Vault
 
   style CWI   fill:#fdf3e7,stroke:#c07000,stroke-width:1.5px
-  style TD    fill:#e8f5ed,stroke:#1a7d3b,stroke-width:1.5px
+  style RJ    fill:#e8f5ed,stroke:#1a7d3b,stroke-width:1.5px
   style Vault fill:#fff8e6,stroke:#a05900,stroke-width:1px
   </div>
 </div>
@@ -377,17 +410,18 @@ flowchart LR
     <tr><td><code>Cipher</code></td><td>External entity</td><td>daemon</td><td>A Bitwarden vault item holding a username and password. The rotation daemon writes the new password here after rotating.</td></tr>
     <tr><td><code>TargetSystem</code></td><td>Entity</td><td>daemon</td><td>An external system whose credentials need rotating. Concrete variants: <code>Entra</code>, <code>MSSQL</code>, <code>CustomScript</code>.</td></tr>
     <tr><td><code>PasswordPolicy</code></td><td>Value</td><td>daemon</td><td>Length and character-class constraints for generated passwords.</td></tr>
-    <tr><td><code>RotationTask</code></td><td>Entity</td><td>daemon</td><td>One execution of a rotation. Created by the server, executed by the daemon. Carries the target system, cipher, account identity, and attempt count.</td></tr>
+    <tr><td><code>RotationAttempt</code></td><td>Entity</td><td>daemon</td><td>One execution attempt of a rotation. Created when the daemon claims a job; executed by the daemon. Carries the target system, cipher, and account identity. Has no retry counter — retries are a fresh attempt on a re-claimed job.</td></tr>
     <tr><td><code>SessionTermination</code></td><td>Entity</td><td>daemon</td><td>Best-effort post-rotation session cleanup. Independent lifecycle — failure does not affect the rotation.</td></tr>
     <tr><td><code>ServerConnection</code></td><td>Entity</td><td>daemon</td><td>The persistent WebSocket/long-poll connection between daemon and server.</td></tr>
     <tr><td><code>DaemonSession</code></td><td>Entity</td><td>daemon</td><td>The daemon's authenticated session. Holds the access token and decrypted org key.</td></tr>
     <tr><td><code>DaemonCredential</code></td><td>External entity</td><td>daemon</td><td>The provisioned OAuth2 credential (client_id + client_secret + local encryption_key).</td></tr>
-    <tr><td><code>TargetSystemRegistration</code></td><td>Entity</td><td>server</td><td>Server-side record of a registered target system. Tracks active/disabled state and in-flight dispatch count for the concurrency cap.</td></tr>
+    <tr><td><code>TargetSystemRegistration</code></td><td>Entity</td><td>server</td><td>Server-side record of a registered target system. Tracks active/disabled state; a rotation config can only be created against (and offered for) an active registration.</td></tr>
     <tr><td><code>DaemonRegistration</code></td><td>Entity</td><td>server</td><td>Server-side record of a registered daemon identity. Revoking it invalidates the daemon's session.</td></tr>
     <tr><td><code>DaemonTargetAssignment</code></td><td>Entity</td><td>server</td><td>Admin-granted permission linking a daemon to a target system. Routing is by assignment: a daemon only receives dispatches for its assigned targets.</td></tr>
     <tr><td><code>DaemonConnection</code></td><td>Entity</td><td>server</td><td>The server's per-daemon view of connection liveness. Drives routing eligibility and scopes per-daemon recovery.</td></tr>
     <tr><td><code>RotationConfig</code></td><td>Entity</td><td>server</td><td>Links a cipher to a target system. Carries rotation triggers (schedule + access-end opt-in), mode (automatic/manual), and schedule state.</td></tr>
-    <tr><td><code>TaskDispatch</code></td><td>Entity</td><td>server</td><td>Server-side tracking record for one dispatched rotation. Routes to a specific daemon, tracks progress, and authorises the cipher write (write window: 15 min).</td></tr>
+    <tr><td><code>RotationJob</code></td><td>Entity</td><td>server</td><td>Server-side record for one rotation occurrence. States: <code>pending | claimed | succeeded | failed | lost | timed_out</code>. The claimed job IS the cipher-write capability — no separate token. The <code>claimed → pending</code> edge is the retry mechanism: a failed attempt with budget remaining returns the job to claimable.</td></tr>
+    <tr><td><code>RotationWork</code></td><td>Surface</td><td>server</td><td>The daemon's pull boundary. Exposes <code>ClaimRotation(claimer, job)</code> — an eligible daemon takes a pending job, the server responds with <code>RotationGranted</code>, and the daemon creates a <code>RotationAttempt</code>. Guarantee: <code>EligibleClaimsOnly</code>.</td></tr>
     <tr><td><code>Schedule</code></td><td>Value</td><td>server</td><td>A cron expression defining a rotation cadence.</td></tr>
     <tr><td><code>RotationSettings</code></td><td>Value</td><td>server</td><td>The rotation triggers for a credential: optional schedule + access-end opt-in.</td></tr>
   </tbody>
@@ -397,7 +431,7 @@ flowchart LR
 <h2 id="s-state-machines"><span class="section-num">4</span>State Machines</h2>
 
 <p>Six entities carry explicit status state machines. Understanding these is key to following any flow.</p>
-<!-- Note: CipherWriteGrant was removed from the spec — the TaskDispatch itself now authorises cipher writes (see §8). DaemonConnection replaces it here. -->
+<!-- Note: CipherWriteGrant was removed from the spec — the RotationJob itself now authorises cipher writes (see §8). DaemonConnection is included here instead. -->
 
 <!-- ─── ServerConnection ─── -->
 <h3 id="sm-connection">ServerConnection</h3>
@@ -442,49 +476,51 @@ stateDiagram-v2
 
 <p>When <code class="state">active</code>, the session holds three values: <code>access_token</code>, <code>expires_at</code>, and <code>organization_key</code>. The org key is derived by decrypting the server's response with the local <code>encryption_key</code> — the server never sees the plaintext.</p>
 
-<!-- ─── RotationTask ─── -->
-<h3 id="sm-task">RotationTask</h3>
-<p>One execution of a rotation, created by the server and executed by the daemon. Retries happen within <code class="state">executing</code> — the task stays there until it succeeds or exhausts all attempts.</p>
+<!-- ─── RotationAttempt ─── -->
+<h3 id="sm-task">RotationAttempt</h3>
+<p>One execution attempt of a rotation. The server creates a fresh attempt each time a daemon claims a job. The daemon executes it exactly once — it does not retry internally. If it fails, the server decides whether to make the job claimable again for a fresh attempt.</p>
 
 <div class="diagram">
-  <div class="diagram-title">RotationTask status</div>
+  <div class="diagram-title">RotationAttempt status</div>
   <div class="mermaid">
 stateDiagram-v2
   direction LR
-  [*] --> pending : PerformDispatch
-  pending --> executing : TaskReceived
-  executing --> executing : RetryRotation\n(attempt_count &lt; 5)
+  [*] --> pending : ReceiveGrant\n(daemon claims job)
+  pending --> executing : ReceiveAttempt
   executing --> succeeded : HandleRotationSucceeded
-  executing --> failed : MarkRotationFailed\n(retries exhausted)
+  executing --> failed : MarkAttemptFailed
   succeeded --> [*]
   failed --> [*]
   </div>
 </div>
 
-<!-- ─── TaskDispatch ─── -->
-<h3 id="sm-dispatch">TaskDispatch</h3>
-<p>The server-side mirror of a <code>RotationTask</code>. Tracks the task's progress and enables recovery. A dispatch can be <em>lost</em> if the connection drops while the task is in flight.</p>
+<!-- ─── RotationJob ─── -->
+<h3 id="sm-dispatch">RotationJob</h3>
+<p>The server's tracking record for one rotation occurrence. A job starts <code class="state">pending</code> — available for any eligible daemon to claim. The <code class="state">claimed → pending</code> edge is the retry mechanism: a failed attempt with budget remaining returns the job to claimable after a backoff, ready for a fresh claim.</p>
 
 <div class="diagram">
-  <div class="diagram-title">TaskDispatch status</div>
+  <div class="diagram-title">RotationJob status</div>
   <div class="mermaid">
 stateDiagram-v2
   direction LR
-  [*] --> dispatched : PerformDispatch
-  dispatched --> in_progress : MarkDispatchStarted\n(task → executing)
-  dispatched --> lost : connection drops
-  in_progress --> completed : MarkDispatchCompleted\n(task → succeeded)
-  in_progress --> failed : MarkDispatchFailed\n(task → failed)
-  in_progress --> lost : connection drops
-  completed --> [*]
+  [*] --> pending : OfferRotation
+  pending --> claimed : ClaimRotation\n(daemon takes job)
+  pending --> timed_out : JobTimesOut\n(deadline exceeded)
+  claimed --> pending : RetryJob\n(attempt failed, retries left)
+  claimed --> succeeded : MarkJobSucceeded\n(attempt → succeeded)
+  claimed --> failed : FailJob\n(attempt_count ≥ max_attempts)
+  claimed --> lost : DaemonConnectionDropsLoseJobs
+  claimed --> timed_out : JobTimesOut\n(deadline exceeded)
+  succeeded --> [*]
   failed --> [*]
   lost --> [*]
+  timed_out --> [*]
   </div>
 </div>
 
 <div class="callout callout-amber">
   <div class="callout-icon">⚠</div>
-  <div class="callout-body">When a dispatch goes <code class="state">lost</code>, its rotation config's <code>next_rotation_at</code> is set to <em>now</em>, so it becomes immediately due for re-dispatch on reconnect. No rotation is permanently lost across a connection drop.</div>
+  <div class="callout-body">When a job goes <code class="state">lost</code>, its rotation config's <code>next_rotation_at</code> is set to <em>now</em>, making it immediately due for a fresh <code>OfferRotation</code>. No rotation is permanently lost across a connection drop.</div>
 </div>
 
 <!-- ─── DaemonConnection ─── -->
@@ -542,7 +578,7 @@ sequenceDiagram
     S-->>D: access_token · enc(org_key) · expires_at
     Note over D: Decrypt org_key with local encryption_key<br/>(encryption_key is never transmitted)
     Note over D: Session → active<br/>Connection → connected
-    S->>D: Push any pending RotationTasks
+    Note over D: Daemon pulls work: claims available RotationJobs<br/>it is eligible for (RotationWork surface)
   else Credentials rejected
     S-->>D: 401 Unauthorized
     Note over D: Session → revoked (terminal)<br/>Connection → disconnected<br/>Cannot reconnect without new credential
@@ -554,7 +590,7 @@ sequenceDiagram
 <p>Access tokens are short-lived. When <code>session.expires_at ≤ now</code>, the rule <code class="rule">SessionExpires</code> fires and transitions the session to <code class="state">expired</code>, which immediately triggers <code class="rule">RefreshSession</code> to move it back to <code class="state">authenticating</code>. The daemon re-presents its credential and gets a fresh token without admin intervention.</p>
 
 <h3>Revocation</h3>
-<p>An admin can revoke a daemon from the server UI. This triggers <code class="rule">HandleSessionRevoked</code> → session goes <code class="state">revoked</code> (terminal). The server also closes the connection. The daemon cannot reconnect until issued a new <code>DaemonCredential</code>. <em>(How re-issuance works is an open question — see §15.)</em></p>
+<p>An admin can revoke a daemon from the server UI. This triggers <code class="rule">HandleSessionRevoked</code> → session goes <code class="state">revoked</code> (terminal). The server also closes the connection. The daemon cannot reconnect until issued a new <code>DaemonCredential</code>. <em>(How re-issuance works is an open question — see §14.)</em></p>
 
 <div class="callout callout-purple">
   <div class="callout-icon">♾</div>
@@ -564,50 +600,44 @@ sequenceDiagram
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-triggers"><span class="section-num">6</span>Rotation Triggers</h2>
 
-<p>A rotation can be triggered in four ways. All four converge on a single choke point — <code class="rule">PerformDispatch</code> — that enforces all eligibility guards before creating a task.</p>
+<p>A rotation can be triggered in three ways. All three converge on a single choke point — <code class="rule">OfferRotation</code> — that enforces all eligibility guards before creating a pending job that daemons can claim.</p>
 
 <div class="diagram">
-  <div class="diagram-title">How triggers converge on dispatch</div>
+  <div class="diagram-title">How triggers converge on OfferRotation</div>
   <div class="mermaid">
 flowchart TB
   T1["⏱ Scheduled\nRotationDue\n(next_rotation_at ≤ now)"]
   T2["👤 On-demand\nTriggerRotationNow\n(admin clicks 'Rotate now')"]
   T3["🔑 Access event\nRotateOnAccessEnd\n(PAM/AAP grant ended)"]
-  T4["🔄 Reconnect recovery\nRedispatchOnReconnect\n(connection re-established)"]
-  T5["📤 Queue drain\nDrainTargetQueue\n(target slot freed)"]
 
-  DP["DispatchRotation(rotation_config, source)"]
+  DP["OfferRotation(rotation_config, source)"]
 
   T1 --> DP
   T2 --> DP
   T3 --> DP
-  T4 --> DP
-  T5 --> DP
 
-  PD{"PerformDispatch\nguards"}
+  PD{"OfferRotation\nguards"}
 
   DP --> PD
 
   G1["✓ config.enabled"]
   G2["✓ mode = automatic"]
-  G3["✓ no in-flight dispatch"]
+  G3["✓ no active job"]
   G4["✓ registration active"]
-  G5["✓ target has capacity"]
 
   PD --> G1
   PD --> G2
   PD --> G3
   PD --> G4
-  PD --> G5
 
-  G1 & G2 & G3 & G4 & G5 --> OUT["Create RotationTask\n+ TaskDispatch\n(routed to chosen daemon)"]
+  G1 & G2 & G3 & G4 --> OUT["Create RotationJob (pending)\nServer notifies eligible daemons\nDaemon claims → RotationAttempt"]
 
   style PD fill:#fff0e6,stroke:#a04000
   style OUT fill:#e8f5ed,stroke:#1a7d3b
   </div>
 </div>
 
-<h3>The four triggers explained</h3>
+<h3>The three triggers explained</h3>
 
 <p><strong>Scheduled (<code class="rule">RotationDue</code>).</strong> Fires as a temporal trigger when <code>rotation_config.next_rotation_at ≤ now</code>. Only fires when a schedule exists — a config with no schedule never has a <code>next_rotation_at</code>, so this trigger never fires for it.</p>
 
@@ -615,15 +645,13 @@ flowchart TB
 
 <p><strong>On access end (<code class="rule">RotateOnAccessEnd</code>).</strong> An upstream access-control system (PAM leasing, AAP, etc.) signals via <code>AccessEventIntake</code> that a grant over a managed credential has ended. The cipher alone identifies the config (one config per cipher). The config must have <code>rotate_on_access_end = true</code>.</p>
 
-<p><strong>Reconnect (<code class="rule">RedispatchOnReconnect</code>).</strong> On every reconnect, the server re-dispatches all due automatic configs. Combined with <code class="rule">ConnectionDropsLoseDispatches</code> (which makes in-flight configs immediately due), this recovers from connection drops. See §10 for the full recovery flow.</p>
-
 <h3>Manual configurations</h3>
-<p>Configs with <code>mode = manual</code> skip all triggers. When they become due, <code>awaiting_manual_rotation</code> is surfaced to administrators. The rotation is performed out-of-band and recorded via <code class="rule">RecordManualRotation</code>. See §12.</p>
+<p>Configs with <code>mode = manual</code> skip all triggers. When they become due, <code>awaiting_manual_rotation</code> is surfaced to administrators. The rotation is performed out-of-band and recorded via <code class="rule">RecordManualRotation</code>. See §11.</p>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-execution"><span class="section-num">7</span>Rotation Execution</h2>
 
-<p>Once the daemon receives a <code>RotationTask</code>, it executes a fixed sequence of steps. On any failure, the whole sequence restarts from step 1 — a fresh password is always generated so the target system and vault cipher stay in sync even after a partial failure.</p>
+<p>Once a daemon claims a job and receives a <code>RotationGranted</code> response, it creates a <code>RotationAttempt</code> and executes a fixed sequence of steps. Each attempt is independent and always starts from step 1 — a fresh password is generated so the target system and vault cipher stay in sync even after a partial failure.</p>
 
 <div class="diagram">
   <div class="diagram-title">Rotation execution sequence</div>
@@ -634,7 +662,13 @@ sequenceDiagram
   participant T as Target System
   participant S as Bitwarden Server
 
-  Note over D: RotationTask received → executing<br/>TaskDispatch → in_progress
+  Note over D,S: Job is pending — server notifies eligible daemons
+
+  D->>S: ClaimRotation(claimer, job)
+  Note over S: Job → claimed · attempt_count++<br/>RotationAudited(outcome: dispatched)
+  S-->>D: RotationGranted(target_system, cipher, account_identity, ...)
+
+  Note over D: ReceiveGrant → RotationAttempt created (pending)<br/>ReceiveAttempt → attempt status: executing
 
   D->>D: 1. Resolve target credentials<br/>Bitwarden SM → env vars → local config
 
@@ -645,35 +679,37 @@ sequenceDiagram
 
   D->>D: 4. Encrypt new password with org_key<br/>(Bitwarden Rust SDK → ciphertext)
 
-  D->>S: 5. SubmitCipherUpdate(grant, cipher, ciphertext)
-  Note over S: AcceptCipherUpdate:<br/>verify grant issued, unexpired, cipher matches<br/>persist ciphertext (zero-knowledge)<br/>grant → consumed
+  D->>S: 5. SubmitCipherUpdate(writer=self, attempt, ciphertext)
+  Note over S: AcceptCipherUpdate:<br/>verify job.daemon = writer · job.status = claimed<br/>persist ciphertext (zero-knowledge)
 
   S-->>D: OK
 
-  Note over D: RotationSucceeded → task → succeeded
-  Note over S: MarkDispatchCompleted:<br/>dispatch → completed<br/>advance schedule (next_rotation_at)<br/>free target concurrency slot
-  Note over S: RotationAudited(outcome: succeeded)
+  Note over D: RotationSucceeded → attempt → succeeded
+  Note over S: MarkJobSucceeded:<br/>job → succeeded · advance schedule (next_rotation_at)<br/>RotationAudited(outcome: succeeded)
   </div>
 </div>
 
-<h3>Retries</h3>
-<p>If any step fails, <code class="event">RotationAttemptFailed</code> is raised. If <code>attempt_count &lt; max_retry_attempts</code> (5), the rule <code class="rule">RetryRotation</code> increments the counter and re-emits <code class="event">ExecuteRotation</code> after an exponential backoff delay (<code>retry_base_delay × 2^(attempt_count − 1)</code>).</p>
+<h3>Server-orchestrated retries</h3>
+<p>If any step fails, <code class="event">RotationAttemptFailed</code> is raised. The daemon calls <code class="rule">MarkAttemptFailed</code> — it does not retry internally. The server observes the attempt transition to <code class="state">failed</code> and decides what happens next:</p>
 
-<p>When retries are exhausted, <code class="rule">MarkRotationFailed</code> marks the task <code class="state">failed</code>. On the server side, <code class="rule">MarkDispatchFailed</code> reschedules the config to <code>now + failure_retry_delay</code> (1 hour) and emits <code class="event">RotationFailed</code> as the seam for a future failure-handling policy (§6.8 — an open question).</p>
+<ul>
+  <li>If <code>job.attempt_count &lt; max_attempts</code> (5), <code class="rule">RetryJob</code> returns the job to <code class="state">pending</code> with a backoff delay (<code>next_claimable_at = now + retry_base_delay</code>). Any eligible daemon can then claim the job — the same one or another assigned daemon, giving natural failover.</li>
+  <li>When attempts are exhausted, <code class="rule">FailJob</code> marks the job <code class="state">failed</code>, reschedules the config to <code>now + failure_retry_delay</code> (1 hour), and emits <code class="event">RotationFailed</code> as the seam for a future failure-handling policy (§6.8 — an open question).</li>
+</ul>
 
 <div class="callout callout-amber">
   <div class="callout-icon">⚠</div>
-  <div class="callout-body"><strong>Important:</strong> A failed rotation is <em>not</em> silently advanced to the next scheduled occurrence. It is rescheduled to a near-term retry window (1 hour) so it tries again soon. The schedule only advances on success.</div>
+  <div class="callout-body"><strong>Important:</strong> A failed rotation is <em>not</em> silently advanced to the next scheduled occurrence. The config is rescheduled to a near-term retry window (1 hour) so it tries again soon. The schedule only advances on success. Each retry is a fresh claim — it may land on a different daemon than the previous attempt.</div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-write-auth"><span class="section-num">8</span>Cipher Write Authorization</h2>
 
-<p>The daemon holds the organization key, which in principle could encrypt writes to any cipher in the org vault. The spec scopes that write authority to the specific cipher being rotated by using the in-flight <code>TaskDispatch</code> itself as the capability — no separate token or grant entity is needed.</p>
+<p>The daemon holds the organization key, which in principle could encrypt writes to any cipher in the org vault. The spec scopes that write authority to the specific cipher being rotated by using the in-flight <code>RotationJob</code> itself as the capability — no separate token or grant entity is needed.</p>
 
 <div class="callout callout-blue">
   <div class="callout-icon">🔑</div>
-  <div class="callout-body"><strong>How it works:</strong> when the daemon submits a cipher write (<code>SubmitCipherUpdate</code>), the server looks up the <code>TaskDispatch</code> for that rotation task and checks three things: the dispatch belongs to <em>this</em> daemon, it is still in-flight, and it is within its write window (15 minutes from dispatch). All three must hold; otherwise the write is rejected and audited.</div>
+  <div class="callout-body"><strong>How it works:</strong> when the daemon submits a cipher write (<code>SubmitCipherUpdate</code>), the server looks up the <code>RotationJob</code> for that attempt's cipher and checks two things: the job is claimed by <em>this</em> daemon (<code>job.daemon = writer</code>), and the job is still <code class="state">claimed</code>. Both must hold; otherwise the write is rejected and audited. There is no time window — ownership and in-flight status are the full check.</div>
 </div>
 
 <div class="diagram">
@@ -683,54 +719,52 @@ sequenceDiagram
   participant S as Bitwarden Server
   participant D as Rotation Daemon
 
-  Note over S: PerformDispatch creates TaskDispatch<br/>(dispatch.daemon = chosen, dispatched_at = now)
-
-  S-->>D: push task
+  Note over S,D: Daemon claimed job → RotationGranted sent<br/>(job.daemon = claimer, job.status = claimed)
 
   Note over D: Execute rotation (resolve creds → generate password<br/>→ update target → encrypt with org_key)
 
-  D->>S: SubmitCipherUpdate(writer=self, task, ciphertext)
+  D->>S: SubmitCipherUpdate(writer=self, attempt, ciphertext)
 
-  Note over S: AcceptCipherUpdate checks:<br/>① dispatch.daemon = writer<br/>② dispatch.status in {dispatched, in_progress}<br/>③ dispatched_at + 15 min > now
+  Note over S: AcceptCipherUpdate checks:<br/>① job.daemon = writer<br/>② job.status = claimed
 
-  alt All checks pass
+  alt Both checks pass
     Note over S: persist ciphertext (zero-knowledge)
     S-->>D: 200 OK
-  else Any check fails (wrong daemon, not in-flight, window elapsed)
+  else Any check fails (wrong daemon, job not claimed)
     Note over S: RejectCipherUpdate<br/>RotationAudited(outcome: write_rejected)
     S-->>D: 403 Forbidden
-    Note over D: RotationAttemptFailed → retry<br/>(fresh dispatch on next attempt)
+    Note over D: RotationAttemptFailed → attempt marked failed<br/>server retries job if budget remains
   end
   </div>
 </div>
 
-<h3>Why the dispatch is sufficient</h3>
-<p>The dispatch is created by the server and records which daemon it was routed to (<code>dispatch.daemon</code>). A write is only accepted from that specific daemon, while the dispatch is still live, within the time window. Combined, these three checks scope the write to exactly the cipher and window the server authorised — without needing a separate token entity.</p>
+<h3>Why the claimed job is sufficient</h3>
+<p>The job is created by the server and records which daemon claimed it (<code>job.daemon</code>). A write is only accepted from that specific daemon, while the job is still claimed. A timed-out, lost, or completed job is no longer <code class="state">claimed</code>, so a stale write from an abandoned attempt is refused automatically — without needing a time window or a separate nonce.</p>
 
-<p>The write is a full-object PUT (today's API has no partial-content update): the daemon GETs the cipher, swaps in the newly-encrypted password, and re-PUTs the whole object. The in-flight dispatch authorises replacing the entire cipher record, not just the password field. A dedicated partial-update endpoint would tighten this further — it's noted as an open question.</p>
+<p>The write is a full-object PUT (today's API has no partial-content update): the daemon GETs the cipher, swaps in the newly-encrypted password, and re-PUTs the whole object. The claimed job authorises replacing the entire cipher record, not just the password field. A dedicated partial-update endpoint would tighten this further — it's noted as an open question.</p>
 
 <h3>API-scoped reads</h3>
-<p>Defence in depth on the read side: the daemon's credential carries <strong>no general cipher-read scope</strong>. The server will not enumerate ciphers for it or serve ciphertext for any cipher except the one currently being rotated (an in-flight dispatch). This limits what a compromised org key can actually expose without also breaching the server-side API authorization.</p>
+<p>Defence in depth on the read side: the daemon's credential carries <strong>no general cipher-read scope</strong>. The server will not enumerate ciphers for it or serve ciphertext for any cipher except the one currently being rotated (a claimed job). This limits what a compromised org key can actually expose without also breaching the server-side API authorization.</p>
 
 <div class="callout callout-teal">
   <div class="callout-icon">♾</div>
-  <div class="callout-body"><strong>Guarantee: <code class="inv">DispatchBoundWrite</code></strong> (on <code>CipherWriteIntake</code>) — a cipher write is accepted only against a <code>TaskDispatch</code> that belongs to this daemon, is in-flight, and is within its window. The target is the dispatch's task cipher; the daemon cannot redirect the write elsewhere. The server stores only ciphertext (zero-knowledge).</div>
+  <div class="callout-body"><strong>Guarantee: <code class="inv">JobBoundWrite</code></strong> (on <code>CipherWriteIntake</code>) — a cipher write is accepted only against a <code>RotationJob</code> claimed by this daemon (<code>job.daemon = writer</code>, <code>job.status = claimed</code>). The target is the attempt's cipher; the daemon cannot redirect the write elsewhere. The server stores only ciphertext (zero-knowledge).</div>
 </div>
 <div class="callout callout-teal">
   <div class="callout-icon">♾</div>
-  <div class="callout-body"><strong>Guarantee: <code class="inv">ApiScopedReads</code></strong> (on <code>CipherWriteIntake</code>) — the daemon's credential has no general cipher-read scope. Only the cipher actively being rotated (in-flight dispatch) is readable, so the organization key cannot be turned into broad vault disclosure without also breaching server-side API authorization.</div>
+  <div class="callout-body"><strong>Guarantee: <code class="inv">ApiScopedReads</code></strong> (on <code>CipherWriteIntake</code>) — the daemon's credential has no general cipher-read scope. Only the cipher actively being rotated (claimed job) is readable, so the organization key cannot be turned into broad vault disclosure without also breaching server-side API authorization.</div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-termination"><span class="section-num">9</span>Session Termination</h2>
 
-<p>After a successful rotation, if <code>task.terminate_sessions = true</code> and the target system has <code>supports_session_termination = true</code>, a <code>SessionTermination</code> is created. Its purpose is to kick existing authenticated sessions for the rotated account — forcing anyone holding the old password to re-authenticate.</p>
+<p>After a successful rotation, if <code>attempt.terminate_sessions = true</code> and the target system has <code>supports_session_termination = true</code>, a <code>SessionTermination</code> is created. Its purpose is to kick existing authenticated sessions for the rotated account — forcing anyone holding the old password to re-authenticate.</p>
 
 <div class="diagram">
   <div class="diagram-title">Session termination — relationship to rotation</div>
   <div class="mermaid">
 flowchart LR
-  R["RotationTask\n(succeeded ✓)"]
+  R["RotationAttempt\n(succeeded ✓)"]
 
   R -->|"terminate_sessions = true\n+ target supports it"| ST["SessionTermination\n(queued → terminating)"]
   R -->|"terminate_sessions = true\n+ target does NOT support it"| W["⚠ SessionTerminationUnsupported\n(warning, rotation still succeeds)"]
@@ -745,12 +779,12 @@ flowchart LR
   </div>
 </div>
 
-<p>Session termination has its own retry counter — up to <code>max_retry_attempts</code> (5) attempts with exponential backoff — completely independent of the rotation task's counter. A termination failure that exhausts retries results in <code class="state">abandoned</code>, which is surfaced to the server but <em>does not fail the rotation</em>. The rotation task already succeeded when the cipher was written.</p>
+<p>Session termination has its own retry counter — up to <code>max_retry_attempts</code> (5) attempts with exponential backoff — completely independent of the rotation attempt's counter. A termination failure that exhausts retries results in <code class="state">abandoned</code>, which is surfaced to the server but <em>does not fail the rotation</em>. The rotation attempt already succeeded when the cipher was written.</p>
 
 <!-- ══════════════════════════════════════════════════════════ -->
 <h2 id="s-recovery"><span class="section-num">10</span>Recovery from Dropped Connections</h2>
 
-<p>When the connection drops, the server cannot confirm which tasks completed. The recovery mechanism ensures nothing is permanently lost: every in-flight dispatch is marked lost, made immediately re-due, and re-dispatched once the connection is restored.</p>
+<p>When a daemon's connection drops, the server cannot confirm which jobs completed. The recovery mechanism ensures nothing is permanently lost: every job claimed by that daemon is marked lost, made immediately re-due, and offered fresh for any eligible daemon to claim.</p>
 
 <div class="diagram">
   <div class="diagram-title">Recovery sequence — connection drop and reconnect</div>
@@ -759,67 +793,34 @@ sequenceDiagram
   participant S as Bitwarden Server
   participant D as Rotation Daemon
 
-  Note over D,S: Connection drops
-  Note over S: ServerConnection → disconnected
+  Note over D,S: Daemon connection drops
+  Note over S: DaemonConnection → disconnected
 
-  Note over S: ConnectionDropsLoseDispatches:<br/>all in-flight dispatches (dispatched or in_progress)<br/>→ DispatchLost(dispatch)
+  Note over S: DaemonConnectionDropsLoseJobs:<br/>all jobs claimed by this daemon<br/>→ JobLost(job) (per-daemon scoped)
 
-  Note over S: MarkDispatchLost (per dispatch):<br/>• dispatch → lost<br/>• config.next_rotation_at = now (immediately due)<br/>• RotationAudited(outcome: lost)<br/>• TargetSlotFreed
-
-  Note over S: InvalidateGrantOnLoss (per dispatch):<br/>• grant → expired immediately<br/>(prevents stale writes after reconnect)
+  Note over S: MarkJobLost (per job):<br/>• job → lost<br/>• config.next_rotation_at = now (immediately due)<br/>• RotationAudited(outcome: lost)
 
   Note over D: Connection → disconnected → connecting<br/>(exponential backoff)
 
   D->>S: Reconnect + authenticate
   Note over D: New session · new org_key
 
-  Note over S: RedispatchOnReconnect:<br/>all due automatic configs re-dispatched<br/>(source: reconnect)
+  Note over S: RotationDue fires for all now-due configs<br/>→ OfferRotation → fresh pending jobs
 
-  S-->>D: Fresh tasks + fresh grants
+  Note over S,D: Any eligible connected daemon claims the new jobs
   </div>
 </div>
 
 <h3>What "immediately due" means</h3>
-<p>Setting <code>next_rotation_at = now</code> makes the config eligible for <code class="rule">RotationDue</code> and <code class="rule">RedispatchOnReconnect</code>. The reconnect rule explicitly re-dispatches all configs where <code>next_rotation_at ≤ now</code>. Because the grant was also expired, a stale write from the pre-drop attempt cannot succeed — the daemon will get a fresh task and a fresh grant.</p>
+<p>Setting <code>next_rotation_at = now</code> makes the config eligible for <code class="rule">RotationDue</code>. That trigger creates a fresh pending <code>RotationJob</code> via <code class="rule">OfferRotation</code>, which any eligible connected daemon can claim. Because the original job is now <code class="state">lost</code> (no longer claimed), a stale write from the pre-drop attempt would be rejected by <code class="rule">RejectCipherUpdate</code> — the job is no longer claimed, so the write check fails.</p>
 
 <div class="callout callout-green">
   <div class="callout-icon">✓</div>
-  <div class="callout-body">This design achieves <em>at-least-once</em> rotation delivery: a task that was in-flight during a drop will be retried after reconnect. The <code class="inv">AtMostOneInFlightDispatchPerConfig</code> invariant plus the fresh grant ensure no double-write or duplicate execution can succeed.</div>
+  <div class="callout-body">This design achieves <em>at-least-once</em> rotation delivery: a job that was in-flight during a drop will be re-offered after the drop. The <code class="inv">AtMostOneActiveJobPerConfig</code> invariant ensures no duplicate concurrent execution. Recovery is scoped per-daemon: only jobs claimed by the dropped daemon are lost; other daemons' work is unaffected.</div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<h2 id="s-fleet"><span class="section-num">11</span>Fleet Spreading</h2>
-
-<p>Multiple rotation configs can share a target system. To prevent overwhelming a single system with concurrent rotations, the server enforces a per-target concurrency cap: <code>max_in_flight_per_target = 10</code>.</p>
-
-<div class="diagram">
-  <div class="diagram-title">Fleet spreading — queue and drain</div>
-  <div class="mermaid">
-flowchart TB
-  subgraph Target["Target System (e.g. MSSQL server)"]
-    Cap["Concurrency cap: 10"]
-  end
-
-  D1["Config A (due)"] -->|"slot available"| Dispatch1["Dispatch ✓"]
-  D2["Config B (due)"] -->|"slot available"| Dispatch2["Dispatch ✓"]
-  D3["Config C (due)"] -->|"cap reached"| Queue["Queued\n(stays due)"]
-
-  Dispatch1 -->|"completes\n→ TargetSlotFreed"| Drain["DrainTargetQueue"]
-  Dispatch2 -->|"completes\n→ TargetSlotFreed"| Drain
-
-  Drain -->|"one slot at a time"| Queue
-
-  style Cap fill:#fff0e6,stroke:#a04000
-  style Queue fill:#f3f0fb,stroke:#5e35b1
-  </div>
-</div>
-
-<p><code class="rule">PerformDispatch</code> checks <code>registration.has_capacity</code> (<code>in_flight_dispatches.count &lt; max_in_flight_per_target</code>). If the cap is hit, the dispatch is silently skipped — the config remains due and will be picked up by <code class="rule">DrainTargetQueue</code> when a slot frees.</p>
-
-<p>The cap is enforced as an invariant: <code class="inv">TargetConcurrencyCapped</code> guarantees <code>in_flight_dispatches.count ≤ max_in_flight_per_target</code> for every registered target.</p>
-
-<!-- ══════════════════════════════════════════════════════════ -->
-<h2 id="s-manual"><span class="section-num">12</span>Manual Rotation Fallback</h2>
+<h2 id="s-manual"><span class="section-num">11</span>Manual Rotation Fallback</h2>
 
 <p>Not every target system has an automated integration the daemon can reach. A rotation config with <code>mode = manual</code> tracks the obligation and records out-of-band compliance.</p>
 
@@ -846,31 +847,33 @@ flowchart LR
 <p>The key rules:</p>
 <ul>
   <li>A manual config can only target a system where <code>supports_automatic_rotation = false</code>.</li>
-  <li>Manual configs are <em>never</em> dispatched to the daemon (invariant: <code class="inv">ManualConfigNeverDispatched</code>).</li>
+  <li>Manual configs are <em>never</em> offered as jobs (invariant: <code class="inv">ManualConfigNeverJobbed</code>).</li>
   <li><code class="rule">RecordManualRotation</code> advances the schedule exactly as a successful automatic rotation would — the audit trail gets an honest record without pretending the system can self-rotate.</li>
 </ul>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<h2 id="s-audit"><span class="section-num">13</span>Audit Trail</h2>
+<h2 id="s-audit"><span class="section-num">12</span>Audit Trail</h2>
 
 <p>The spec emits a <code class="event">RotationAudited</code> event on every significant rotation event. The events are a pure sink — no rule chains from them. Durable, append-only, tamper-evident storage is the existing Phase 1 audit log's responsibility.</p>
 
 <table>
   <thead><tr><th>Outcome</th><th>Emitted by</th><th>When</th></tr></thead>
   <tbody>
-    <tr><td><code>dispatched</code></td><td><code class="rule">PerformDispatch</code></td><td>Task sent to daemon. Carries <code>source</code> (scheduled / on_demand / access_end / reconnect).</td></tr>
-    <tr><td><code>succeeded</code></td><td><code class="rule">MarkDispatchCompleted</code></td><td>Rotation completed, cipher updated. Carries <code>source</code>.</td></tr>
-    <tr><td><code>failed</code></td><td><code class="rule">MarkDispatchFailed</code></td><td>Rotation exhausted retries. Carries <code>source</code> and <code>reason</code>.</td></tr>
-    <tr><td><code>lost</code></td><td><code class="rule">MarkDispatchLost</code></td><td>Connection dropped mid-rotation. Carries <code>source</code>.</td></tr>
-    <tr><td><code>write_rejected</code></td><td><code class="rule">RejectCipherUpdate</code></td><td>Daemon presented an invalid or expired grant.</td></tr>
+    <tr><td><code>dispatched</code></td><td><code class="rule">ClaimRotation</code></td><td>Daemon claimed the job and will execute an attempt. Carries <code>source</code> (scheduled / on_demand / access_end).</td></tr>
+    <tr><td><code>succeeded</code></td><td><code class="rule">MarkJobSucceeded</code></td><td>Rotation completed, cipher updated. Carries <code>source</code>.</td></tr>
+    <tr><td><code>attempt_failed</code></td><td><code class="rule">RetryJob</code></td><td>An attempt failed but retries remain; job returned to pending. Carries <code>source</code> and <code>reason</code>.</td></tr>
+    <tr><td><code>failed</code></td><td><code class="rule">FailJob</code></td><td>All attempts exhausted. Carries <code>source</code> and <code>reason</code>.</td></tr>
+    <tr><td><code>lost</code></td><td><code class="rule">MarkJobLost</code></td><td>Daemon connection dropped mid-attempt. Carries <code>source</code>.</td></tr>
+    <tr><td><code>timed_out</code></td><td><code class="rule">JobTimesOut</code></td><td>Job exceeded its deadline unresolved (unroutable or stuck daemon). Carries <code>source</code>.</td></tr>
+    <tr><td><code>write_rejected</code></td><td><code class="rule">RejectCipherUpdate</code></td><td>Daemon submitted a cipher write against a job it does not own or that is no longer claimed.</td></tr>
     <tr><td><code>manual_recorded</code></td><td><code class="rule">RecordManualRotation</code></td><td>Admin confirmed out-of-band rotation. Carries <code>actor</code> (the admin).</td></tr>
   </tbody>
 </table>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<h2 id="s-invariants"><span class="section-num">14</span>Invariants</h2>
+<h2 id="s-invariants"><span class="section-num">13</span>Invariants</h2>
 
-<p>The spec declares seven invariants — structural properties that must hold at all times. Violations indicate a bug.</p>
+<p>The spec declares eight invariants — structural properties that must hold at all times. Violations indicate a bug.</p>
 
 <div class="inv-card">
   <h4>AtMostOneActiveSession <small style="font-weight:400;color:var(--muted)">(daemon)</small></h4>
@@ -879,7 +882,7 @@ flowchart LR
 
 <div class="inv-card">
   <h4>OneRegistrationPerTargetSystem <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
-  <p>A <code>TargetSystem</code> has at most one <code>TargetSystemRegistration</code>. Prevents duplicate concurrency-cap tracking.</p>
+  <p>A <code>TargetSystem</code> has at most one <code>TargetSystemRegistration</code>. Keeps a single, unambiguous active/disabled state per target so the offer guard and assignment lookups can't disagree.</p>
 </div>
 
 <div class="inv-card">
@@ -888,13 +891,8 @@ flowchart LR
 </div>
 
 <div class="inv-card">
-  <h4>AtMostOneInFlightDispatchPerConfig <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
-  <p>A <code>RotationConfig</code> has at most one in-flight dispatch at a time. Prevents duplicate concurrent executions of the same credential rotation.</p>
-</div>
-
-<div class="inv-card">
-  <h4>TargetConcurrencyCapped <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
-  <p>The number of in-flight dispatches against any one target system never exceeds <code>max_in_flight_per_target</code> (10). Enforces the fleet-spreading cap. (See §11.)</p>
+  <h4>AtMostOneActiveJobPerConfig <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
+  <p>A <code>RotationConfig</code> has at most one pending-or-claimed job at a time. Makes the attempt-to-job correlation unambiguous and prevents duplicate concurrent executions of the same credential rotation.</p>
 </div>
 
 <div class="inv-card">
@@ -903,20 +901,35 @@ flowchart LR
 </div>
 
 <div class="inv-card">
-  <h4>ManualConfigNeverDispatched <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
-  <p>A <code>RotationConfig</code> with <code>mode = manual</code> has zero dispatches. Manual rotations are recorded out-of-band via <code class="rule">RecordManualRotation</code>; the daemon never touches them. (See §12.)</p>
+  <h4>ManualConfigNeverJobbed <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
+  <p>A <code>RotationConfig</code> with <code>mode = manual</code> has zero jobs. Manual rotations are recorded out-of-band via <code class="rule">RecordManualRotation</code>; the daemon never touches them. (See §11.)</p>
+</div>
+
+<div class="inv-card">
+  <h4>OneAssignmentPerDaemonTarget <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
+  <p>At most one <code>DaemonTargetAssignment</code> per <code>(daemon, target system)</code> pair. Keeps the eligibility relation clean — a daemon is either assigned a target or it isn't.</p>
+</div>
+
+<div class="inv-card">
+  <h4>OneConnectionPerDaemon <small style="font-weight:400;color:var(--muted)">(server)</small></h4>
+  <p>Each <code>DaemonRegistration</code> has exactly one <code>DaemonConnection</code> record, created with the registration (starting <code class="state">disconnected</code>). It is the single source of truth for that daemon's liveness, read by both claim eligibility and per-daemon recovery.</p>
 </div>
 
 <!-- ══════════════════════════════════════════════════════════ -->
-<h2 id="s-openqs"><span class="section-num">15</span>Open Questions</h2>
+<h2 id="s-openqs"><span class="section-num">14</span>Open Questions</h2>
 
-<p>Fourteen design questions remain unresolved. They are grouped below by topic.</p>
+<p>Fifteen design questions remain unresolved. They are grouped below by topic.</p>
 
 <h3>Security &amp; authorization</h3>
 
 <div class="oq-card">
   <h4>Read blast radius</h4>
-  <p>The dispatch-bound write and API-scoped read controls contain the blast radius at the authorization layer, but the org key itself remains the theoretical crypto ceiling — a key compromise combined with an API authorization bypass would expose the org vault. Closing it at the crypto layer (so a stolen key reveals nothing beyond the managed cipher) requires per-cipher item keys or a write-only asymmetric scheme; both depend on Bitwarden per-item cipher key support. Deferred.</p>
+  <p>The job-bound write and API-scoped read controls contain the blast radius at the authorization layer, but the org key itself remains the theoretical crypto ceiling — a key compromise combined with an API authorization bypass would expose the org vault. Closing it at the crypto layer (so a stolen key reveals nothing beyond the managed cipher) requires per-cipher item keys or a write-only asymmetric scheme; both depend on Bitwarden per-item cipher key support. Deferred.</p>
+</div>
+
+<div class="oq-card">
+  <h4>Cipher write granularity</h4>
+  <p>With no partial-content API, rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the entire cipher (not just its password field) and requires a read-before-write. A dedicated partial-update/rotate endpoint would remove the read and tighten write scope. A separate bearer write-token (a field on the job) would add defence in depth against an ownership-check bug. Both deferred.</p>
 </div>
 
 <div class="oq-card">
@@ -924,7 +937,7 @@ flowchart LR
   <p>Once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon? There's currently no mechanism for this in the spec.</p>
 </div>
 
-<h3>Scheduling &amp; dispatch</h3>
+<h3>Scheduling &amp; job lifecycle</h3>
 
 <div class="oq-card">
   <h4>Non-cron cadences</h4>
@@ -933,41 +946,41 @@ flowchart LR
 
 <div class="oq-card">
   <h4>Failure handling (§6.8)</h4>
-  <p><code class="rule">MarkDispatchFailed</code> currently reschedules to <code>now + failure_retry_delay</code> (1 hour) and emits <code class="event">RotationFailed</code> as a seam. §6.8 should define the real policy — retry count, backoff strategy, alerting, and auto-disable after a threshold. Until then, <code>next_rotation_at</code> on failure is a placeholder.</p>
+  <p><code class="rule">FailJob</code> and <code class="rule">JobTimesOut</code> reschedule to <code>now + failure_retry_delay</code> (1 hour) and emit <code class="event">RotationFailed</code> as a seam. §6.8 should define the real policy — alerting, auto-disable after a threshold — and take ownership of <code>next_rotation_at</code> on terminal failure.</p>
 </div>
 
 <div class="oq-card">
-  <h4>Reconcile task creation</h4>
-  <p>Both the daemon's <code class="rule">OnTaskDispatched</code> and the server's <code class="rule">PerformDispatch</code> model <code>RotationTask</code> creation. The server should be authoritative. The daemon's entry point needs adjusting to reflect this.</p>
+  <h4>Unroutable-job escalation</h4>
+  <p>A job that stays <code class="state">pending</code> because no eligible daemon is connected or assigned currently waits until claimed or until <code class="rule">JobTimesOut</code>. Past a threshold it should escalate to an operator; delivery shares the unspecified alerting seam with manual-obligation escalation and §6.8 failure handling.</p>
 </div>
 
 <div class="oq-card">
   <h4>On-demand audit attribution</h4>
-  <p>On-demand and access-triggered dispatches record a <code>source</code> on the <code>TaskDispatch</code> but not the triggering admin. Only <code>manual_recorded</code> carries an <code>actor</code>. Should the audit attribute the on-demand actor end-to-end?</p>
+  <p>On-demand and access-triggered jobs record a <code>source</code> but not the triggering admin. Only <code>manual_recorded</code> carries an <code>actor</code>. Should the audit attribute the on-demand actor end-to-end?</p>
 </div>
 
 <h3>Fleet &amp; routing</h3>
 
 <div class="oq-card">
-  <h4>Fleet spreading dimension</h4>
-  <p>The concurrency cap is per target system. Should there also be a per-connector or per-daemon cap to protect the connector itself? How does that interact with multi-daemon routing?</p>
+  <h4>Rotation throttling</h4>
+  <p>Many credentials on one target coming due together could hammer that target or connector. This is deliberately <em>not</em> modelled server-side — no fleet-scale deployment is assumed — so there is no longer a per-target concurrency cap. If throttling becomes necessary, the spec's position is that it belongs in the daemon/connector rather than the server scheduler.</p>
 </div>
 
 <div class="oq-card">
-  <h4>Multi-daemon routing</h4>
-  <p>When more than one daemon is connected, how does the server choose which daemon receives a dispatch? Is recovery scoped per-daemon (only re-dispatch to the daemon that was handling it) or global?</p>
+  <h4>Daemon connectivity edges</h4>
+  <p><code class="rule">MarkDaemonConnected</code>/<code class="rule">MarkDaemonDisconnected</code> react to server-observed events. Reconcile which daemon-side transitions (ServerConnection / DaemonSession in rotation-daemon.allium) raise each edge — in particular whether a session expiry that is not a transport drop counts as disconnected for routing.</p>
 </div>
 
 <h3>Configuration lifecycle</h3>
 
 <div class="oq-card">
   <h4>Mode switching</h4>
-  <p>Can an admin move a <code>RotationConfig</code> between <code>automatic</code> and <code>manual</code> after creation? If so, what happens to its schedule and any in-flight dispatch? The <code class="inv">ManualConfigNeverDispatched</code> invariant assumes mode is fixed at creation.</p>
+  <p>Can an admin move a <code>RotationConfig</code> between <code>automatic</code> and <code>manual</code> after creation? If so, what happens to its schedule and any active job? The <code class="inv">ManualConfigNeverJobbed</code> invariant assumes mode is fixed at creation.</p>
 </div>
 
 <div class="oq-card">
   <h4>Cancel vs. stop-new on state changes</h4>
-  <p>Disabling a target system, pausing a config, or applying new settings currently only stop new dispatches — in-flight dispatches are unaffected. Should any of these operations cancel in-flight work?</p>
+  <p>Disabling a target system, pausing a config, applying new settings, or unassigning a daemon currently only stop new jobs from being offered — claimed jobs are unaffected. Should any of these operations cancel in-flight work?</p>
 </div>
 
 <div class="oq-card">
@@ -989,7 +1002,7 @@ flowchart LR
 
 <div class="oq-card">
   <h4>Secrets Manager support (Phase 1 non-goal)</h4>
-  <p>A future configuration would point at an SM secret rather than a vault cipher. The <code>cipher</code> field on <code>RotationConfig</code> and <code>daemon/RotationTask.cipher</code> are the intended seam. The scheduling, dispatch, recovery, and audit machinery is designed to carry an SM rotation unchanged — but this needs confirmation before generalising.</p>
+  <p>A future configuration would point at an SM secret rather than a vault cipher. The <code>cipher</code> field on <code>RotationConfig</code> and <code>daemon/RotationAttempt.cipher</code> are the intended seam. The scheduling, offer/claim, recovery, and audit machinery is designed to carry an SM rotation unchanged — but this needs confirmation before generalising.</p>
 </div>
 
 </main>
