@@ -45,6 +45,12 @@ entity TargetSystem {
     kind: Entra | MSSQL | CustomScript
     password_policy: PasswordPolicy
     supports_session_termination: Boolean
+    -- Whether the daemon can rotate this system's credentials automatically.
+    -- Orthogonal to kind: a system may have no automated integration, or be one
+    -- the daemon cannot reach, and so must be rotated by hand. The server uses
+    -- this to constrain a rotation configuration's mode (see
+    -- rotation-server.allium / CreateRotationConfig and the manual fallback).
+    supports_automatic_rotation: Boolean
 }
 
 variant Entra : TargetSystem {
@@ -78,6 +84,30 @@ entity RotationTask {
         executing -> succeeded
         executing -> failed
         terminal: succeeded, failed
+    }
+
+    has_retries: attempt_count < config.max_retry_attempts
+}
+
+-- Session termination
+-- A rotation task may request that active sessions for the rotated account be
+-- terminated. Termination is best-effort and decoupled from the rotation: the
+-- rotation task succeeds once the password is rotated. When requested and
+-- supported, termination runs as its own task with an independent retry
+-- lifecycle so a termination failure never re-runs the rotation.
+
+entity SessionTermination {
+    id: String
+    rotation_task: RotationTask
+    status: queued | terminating | terminated | abandoned
+    attempt_count: Integer
+    failure_reason: String?
+
+    transitions status {
+        queued -> terminating
+        terminating -> terminated
+        terminating -> abandoned
+        terminal: terminated, abandoned
     }
 
     has_retries: attempt_count < config.max_retry_attempts
@@ -130,6 +160,15 @@ surface IntegrationSurface {
     provides:
         RotationSucceeded(task)
         RotationAttemptFailed(task, reason)
+}
+
+surface SessionTerminationSurface {
+    facing _: Integration
+    context termination: SessionTermination where status = terminating
+
+    provides:
+        SessionTerminationSucceeded(termination)
+        SessionTerminationAttemptFailed(termination, reason)
 }
 
 -- Connection lifecycle
@@ -209,6 +248,17 @@ rule HandleRotationSucceeded {
     when: RotationSucceeded(task)
     requires: task.status = executing
     ensures: task.status = succeeded
+    ensures:
+        if task.terminate_sessions and task.target_system.supports_session_termination:
+            SessionTermination.created(rotation_task: task, status: queued, attempt_count: 0)
+        if task.terminate_sessions and not task.target_system.supports_session_termination:
+            SessionTerminationUnsupported(task: task)
+    @guidance
+        -- Session termination is best-effort and decoupled from rotation success:
+        -- the task succeeds once the password is rotated and the cipher is synced.
+        -- When termination is requested but the target system does not support it,
+        -- a warning is surfaced to the Bitwarden server (via SessionTerminationUnsupported)
+        -- rather than failing the task.
 }
 
 rule RetryRotation {
@@ -228,7 +278,56 @@ rule MarkRotationFailed {
     ensures: task.failure_reason = reason
 }
 
+-- Session termination execution
+
+rule SessionTerminationReceived {
+    when: termination: SessionTermination.created
+    requires: termination.status = queued
+    ensures: termination.status = terminating
+    ensures: ExecuteSessionTermination(termination)
+}
+
+rule ExecuteSessionTermination {
+    when: ExecuteSessionTermination(termination)
+    requires: termination.status = terminating
+    -- Terminate active sessions for termination.rotation_task.account_identity on
+    -- termination.rotation_task.target_system, using the same connection credentials
+    -- resolved for rotation (Secrets Manager → env vars → local config).
+    -- Outcome reported by the SessionTerminationSurface via
+    -- SessionTerminationSucceeded or SessionTerminationAttemptFailed.
+}
+
+rule HandleSessionTerminationSucceeded {
+    when: SessionTerminationSucceeded(termination)
+    requires: termination.status = terminating
+    ensures: termination.status = terminated
+}
+
+rule RetrySessionTermination {
+    when: SessionTerminationAttemptFailed(termination, reason)
+    requires: termination.status = terminating and termination.has_retries
+    ensures: termination.attempt_count = termination.attempt_count + 1
+    ensures: ExecuteSessionTermination(termination)
+    @guidance
+        -- Wait retry_base_delay * 2^(termination.attempt_count - 1) before
+        -- re-emitting ExecuteSessionTermination. This retry counter is independent
+        -- of the rotation's: a termination failure never re-runs the rotation.
+}
+
+rule MarkSessionTerminationAbandoned {
+    when: SessionTerminationAttemptFailed(termination, reason)
+    requires: termination.status = terminating and not termination.has_retries
+    ensures: termination.status = abandoned
+    ensures: termination.failure_reason = reason
+    @guidance
+        -- A terminal termination failure does not affect the rotation, which has
+        -- already succeeded. The failure is surfaced to the Bitwarden server.
+}
+
 open question "Daemon authentication: possibly a combination of OAuth client_id/secret and API key, TBD."
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
-open question "How are TargetSystem instances registered and managed on the Bitwarden server?"
-open question "Should a task mid-execution when the connection dropped be re-delivered and retried from scratch on reconnect, or tracked server-side as already in-progress?"
+-- Resolved in rotation-server.allium: TargetSystem instances are registered and
+-- managed server-side via TargetSystemRegistration.
+-- Resolved in rotation-server.allium: tasks are tracked server-side via TaskDispatch;
+-- a dispatch in flight when the connection drops is marked lost and re-dispatched
+-- (as a fresh task) on reconnect.

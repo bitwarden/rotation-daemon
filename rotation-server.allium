@@ -1,0 +1,474 @@
+-- allium: 3
+-- rotation-server.allium
+
+use "./rotation-daemon.allium" as daemon
+
+-- Scope: Bitwarden server side of credential rotation
+-- Includes:
+--   Target system registration and management
+--   Rotation configuration (linking a cipher to a target system, with schedule,
+--     mode and settings)
+--   Rotation scheduling and triggering: on a schedule, on demand, and on access
+--     events (an upstream grant over the credential ending)
+--   Manual rotation fallback for systems that cannot be rotated automatically:
+--     tracking the obligation and recording an out-of-band rotation
+--   Task dispatch and server-side tracking, including recovery when the daemon
+--     connection drops
+--   Audit emission for every rotation attempt and outcome (Goal 4)
+-- Excludes:
+--   Daemon execution of rotations (governed by rotation-daemon.allium)
+--   Daemon authentication and connection establishment (open question)
+--   Bitwarden cipher/Secrets Manager internals (external systems)
+--   Audit-log persistence and WORM/tamper-evidence: this spec emits the audit
+--     events; durable, append-only storage is the existing Phase 1 audit log's
+--     concern (mirrors how pam.allium models LeaseActivationAudited)
+--   Discovery of privileged/orphaned accounts, ephemeral account provisioning,
+--     dependency orchestration beyond the credential, and post-rotation scripting
+--     (Phase 1 non-goals)
+--   Rotation of Secrets Manager secrets (Phase 1 non-goal; see the SM seam note
+--     by RotationConfig and the closing open question)
+-- Dependencies:
+--   daemon/Cipher, daemon/TargetSystem, daemon/RotationTask, daemon/ServerConnection
+--   are governed by rotation-daemon.allium and referenced here by qualified name.
+
+config {
+    failure_retry_delay: Duration = 1.hour
+}
+
+-- Parties
+
+-- The administrator is a Bitwarden user managing rotation. Their identity and
+-- authentication are governed by the Bitwarden platform, outside this spec.
+external entity Administrator {}
+
+-- An upstream access-control system (PAM leasing, AAP grants, ...) that reports
+-- when a grant over a managed credential ends. Modelled as an abstract integration
+-- party so rotation depends on the access-event signal, not on any one leasing
+-- spec. See AccessEventIntake and RotateOnAccessEnd.
+actor AccessEventSource {
+    identified_by: cipher.id
+}
+
+-- Entities
+
+entity TargetSystemRegistration {
+    id: String
+    target_system: daemon/TargetSystem
+    status: active | disabled
+
+    transitions status {
+        active -> disabled
+        disabled -> active
+    }
+}
+
+-- A rotation configuration links a cipher to a registered target system and
+-- carries the rotation settings and schedule. There is one configuration per
+-- (cipher, target_system) pair.
+--
+-- SM seam (Phase 1 non-goal): a future Secrets Manager configuration would point
+-- at an SM secret rather than a cipher. The `cipher` field here and
+-- daemon/RotationTask.cipher are the single seam to generalise; the scheduling,
+-- dispatch, recovery and audit machinery below is intended to carry an SM rotation
+-- unchanged. Kept cipher-specific for now to avoid speculative structure.
+entity RotationConfig {
+    id: String
+    cipher: daemon/Cipher
+    target_system: daemon/TargetSystem
+    account_identity: String
+    terminate_sessions: Boolean
+    -- automatic: the daemon rotates this credential (on schedule, on demand, or on
+    --   an access event). Only allowed when the target system can be rotated
+    --   automatically.
+    -- manual: the daemon cannot rotate this credential, so the obligation is
+    --   tracked and surfaced for an admin to satisfy out of band (Goal 3).
+    mode: automatic | manual
+    -- Opt-in: dispatch a rotation when an access grant over this credential ends
+    -- (Goal 2). Honoured only for automatic configurations.
+    rotate_on_access_end: Boolean
+    rotation_interval: Duration
+    next_rotation_at: Timestamp
+    enabled: Boolean
+    last_rotation_at: Timestamp?
+
+    dispatches: TaskDispatch with rotation_config = this
+    in_flight_dispatches: dispatches where status in {dispatched, in_progress}
+    has_in_flight_dispatch: in_flight_dispatches.count > 0
+
+    -- A manual configuration that has come due: the obligation an admin must
+    -- satisfy and record (see RecordManualRotation). Surfaced, never dispatched.
+    awaiting_manual_rotation: mode = manual and enabled and next_rotation_at <= now
+}
+
+-- A server-side record tracking one dispatched rotation, used to observe
+-- progress and to recover when the connection drops mid-execution.
+entity TaskDispatch {
+    id: String
+    rotation_config: RotationConfig
+    rotation_task: daemon/RotationTask
+    status: dispatched | in_progress | completed | failed | lost
+    -- Why this rotation was dispatched. Recorded as part of the rotation trail
+    -- (Goal 4) and distinguishes a recovery re-dispatch from a first attempt.
+    source: scheduled | on_demand | access_end | reconnect
+    dispatched_at: Timestamp
+
+    transitions status {
+        dispatched -> in_progress
+        dispatched -> lost
+        in_progress -> completed
+        in_progress -> failed
+        in_progress -> lost
+        terminal: completed, failed, lost
+    }
+}
+
+-- Target system registration
+
+rule RegisterTargetSystem {
+    when: RegisterTargetSystem(target_system)
+    requires: not exists TargetSystemRegistration{target_system: target_system}
+    ensures: TargetSystemRegistration.created(target_system: target_system, status: active)
+}
+
+rule DisableTargetSystem {
+    when: DisableTargetSystem(registration)
+    requires: registration.status = active
+    ensures: registration.status = disabled
+    @guidance
+        -- A disabled target system stops new rotations being dispatched for its
+        -- configurations; in-flight dispatches are unaffected.
+}
+
+rule EnableTargetSystem {
+    when: EnableTargetSystem(registration)
+    requires: registration.status = disabled
+    ensures: registration.status = active
+}
+
+-- Rotation configuration
+
+rule CreateRotationConfig {
+    when: CreateRotationConfig(cipher, target_system, account_identity, terminate_sessions, rotation_interval, mode, rotate_on_access_end)
+    let registration = TargetSystemRegistration{target_system: target_system}
+    requires: exists registration
+    requires: registration.status = active
+    requires: not exists RotationConfig{cipher: cipher, target_system: target_system}
+    -- An automatic configuration can only target a system the daemon can rotate;
+    -- a system without an automated integration must be managed manually (Goal 3).
+    requires: mode = manual or target_system.supports_automatic_rotation
+    ensures: RotationConfig.created(
+        cipher: cipher,
+        target_system: target_system,
+        account_identity: account_identity,
+        terminate_sessions: terminate_sessions,
+        mode: mode,
+        rotate_on_access_end: rotate_on_access_end,
+        rotation_interval: rotation_interval,
+        next_rotation_at: now + rotation_interval,
+        enabled: true
+    )
+    @guidance
+        -- Incremental adoption (Goal 5): configurations are created one at a time,
+        -- per (cipher, target_system). There is no estate-wide migration step;
+        -- registering a target system and creating its first configuration is the
+        -- whole onboarding path for that system.
+}
+
+-- Scheduling and triggering
+--
+-- All three rotation triggers — schedule (RotationDue), on demand
+-- (TriggerRotationNow) and access events (RotateOnAccessEnd) — converge on the
+-- single DispatchRotation chained trigger, so PerformDispatch is the one place
+-- that enforces eligibility (enabled, automatic, registration active, no in-flight
+-- dispatch). The trigger carries why the rotation fired, recorded on the dispatch.
+
+rule RotationDue {
+    when: rotation_config: RotationConfig.next_rotation_at <= now
+    requires: rotation_config.enabled
+    requires: rotation_config.mode = automatic
+    requires: not rotation_config.has_in_flight_dispatch
+    ensures: DispatchRotation(rotation_config: rotation_config, source: scheduled)
+    @guidance
+        -- A manual configuration that comes due is NOT dispatched; its due-ness is
+        -- the obligation (awaiting_manual_rotation), surfaced for an admin to act
+        -- on and clear via RecordManualRotation.
+}
+
+rule TriggerRotationNow {
+    when: TriggerRotation(_, rotation_config)
+    requires: rotation_config.mode = automatic
+    requires: rotation_config.enabled
+    requires: not rotation_config.has_in_flight_dispatch
+    ensures: DispatchRotation(rotation_config: rotation_config, source: on_demand)
+    @guidance
+        -- On-demand rotation (Goal 2): an admin rotates a managed credential
+        -- immediately, outside its schedule. Only meaningful for automatic
+        -- configurations — a manual one is rotated by hand and recorded via
+        -- RecordManualRotation.
+}
+
+rule RotateOnAccessEnd {
+    when: AccessGrantEnded(cipher)
+    for rotation_config in RotationConfigs where cipher = cipher
+                                             and enabled
+                                             and mode = automatic
+                                             and rotate_on_access_end:
+        ensures: DispatchRotation(rotation_config: rotation_config, source: access_end)
+    @guidance
+        -- Rotation on access events (Goal 2). When an upstream access-control
+        -- system signals that a grant over a managed credential has ended — a PAM
+        -- lease expiring or being revoked, an AAP grant ending — every automatic
+        -- configuration for that cipher that opted in is dispatched. The signal is
+        -- intentionally abstract (AccessEventIntake): rotation depends on the
+        -- event, not on any particular leasing spec, so PAM, AAP leasing or a
+        -- future Secrets Manager can all emit it. Routing through DispatchRotation
+        -- means PerformDispatch applies the usual guards, so an ineligible config
+        -- (disabled, in-flight, deregistered) is silently skipped.
+}
+
+rule RedispatchOnReconnect {
+    when: _: daemon/ServerConnection.status transitions_to connected
+    ensures:
+        for rotation_config in RotationConfigs where enabled and mode = automatic and next_rotation_at <= now:
+            DispatchRotation(rotation_config: rotation_config, source: reconnect)
+    @guidance
+        -- On reconnect, re-dispatch every automatic configuration that is due.
+        -- Combined with ConnectionDropsLoseDispatches (which marks in-flight
+        -- dispatches lost and makes their configs due again), this recovers
+        -- rotations interrupted by a connection drop. has_in_flight_dispatch in
+        -- PerformDispatch prevents duplicate dispatch for configs already in flight.
+}
+
+rule PerformDispatch {
+    when: DispatchRotation(rotation_config, source)
+    let registration = TargetSystemRegistration{target_system: rotation_config.target_system}
+    requires: rotation_config.enabled
+    requires: rotation_config.mode = automatic
+    requires: not rotation_config.has_in_flight_dispatch
+    requires: exists registration
+    requires: registration.status = active
+    ensures:
+        let task = daemon/RotationTask.created(
+            target_system: rotation_config.target_system,
+            cipher: rotation_config.cipher,
+            account_identity: rotation_config.account_identity,
+            terminate_sessions: rotation_config.terminate_sessions,
+            status: pending,
+            attempt_count: 0
+        )
+        TaskDispatch.created(
+            rotation_config: rotation_config,
+            rotation_task: task,
+            status: dispatched,
+            source: source,
+            dispatched_at: now
+        )
+        RotationAudited(rotation_config: rotation_config, outcome: dispatched, source: source)
+    @guidance
+        -- The server is the authoritative creator of the RotationTask. The daemon
+        -- observes the new task and executes it (see rotation-daemon.allium /
+        -- TaskReceived). See open question on reconciling this with the daemon's
+        -- OnTaskDispatched rule.
+}
+
+-- Server-side tracking of execution progress (observed from the daemon's
+-- RotationTask lifecycle). Each tracking transition also emits the matching audit
+-- event so the Phase 1 audit log records every attempt and its outcome (Goal 4).
+
+rule MarkDispatchStarted {
+    when: task: daemon/RotationTask.status transitions_to executing
+    let dispatch = TaskDispatch{rotation_task: task}
+    requires: exists dispatch
+    requires: dispatch.status = dispatched
+    ensures: dispatch.status = in_progress
+}
+
+rule MarkDispatchCompleted {
+    when: task: daemon/RotationTask.status transitions_to succeeded
+    let dispatch = TaskDispatch{rotation_task: task}
+    requires: exists dispatch
+    requires: dispatch.status = in_progress
+    ensures: dispatch.status = completed
+    ensures: dispatch.rotation_config.last_rotation_at = now
+    ensures: dispatch.rotation_config.next_rotation_at = now + dispatch.rotation_config.rotation_interval
+    ensures: RotationAudited(rotation_config: dispatch.rotation_config, outcome: succeeded, source: dispatch.source)
+}
+
+rule MarkDispatchFailed {
+    when: task: daemon/RotationTask.status transitions_to failed
+    let dispatch = TaskDispatch{rotation_task: task}
+    requires: exists dispatch
+    requires: dispatch.status = in_progress
+    ensures: dispatch.status = failed
+    ensures: dispatch.rotation_config.next_rotation_at = now + config.failure_retry_delay
+    ensures: RotationAudited(rotation_config: dispatch.rotation_config, outcome: failed, source: dispatch.source, reason: task.failure_reason)
+    @guidance
+        -- A failed rotation is rescheduled after a delay. Whether failures should
+        -- also raise an alert or escalate is an open question.
+}
+
+-- Recovery
+
+rule ConnectionDropsLoseDispatches {
+    when: _: daemon/ServerConnection.status transitions_to disconnected
+    for dispatch in TaskDispatches where status in {dispatched, in_progress}:
+        ensures: DispatchLost(dispatch: dispatch)
+    @guidance
+        -- A dispatch that was in flight when the connection dropped cannot be
+        -- confirmed. Each is marked lost (see MarkDispatchLost) and its
+        -- configuration is made due again for re-dispatch on reconnect
+        -- (see RedispatchOnReconnect).
+}
+
+rule MarkDispatchLost {
+    when: DispatchLost(dispatch)
+    requires: dispatch.status in {dispatched, in_progress}
+    ensures: dispatch.status = lost
+    ensures: dispatch.rotation_config.next_rotation_at = now
+    ensures: RotationAudited(rotation_config: dispatch.rotation_config, outcome: lost, source: dispatch.source)
+}
+
+-- Manual rotation fallback (Goal 3)
+
+rule RecordManualRotation {
+    when: RecordManualRotation(actor, rotation_config)
+    requires: rotation_config.mode = manual
+    ensures: rotation_config.last_rotation_at = now
+    ensures: rotation_config.next_rotation_at = now + rotation_config.rotation_interval
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: manual_recorded, actor: actor)
+    @guidance
+        -- For a manually-managed configuration the daemon never rotates; instead
+        -- the obligation surfaces (awaiting_manual_rotation) and an admin records
+        -- that they rotated the credential out of band. Recording resets the
+        -- schedule and writes the audit trail, exactly as a successful automatic
+        -- rotation would — an honest record that the obligation was met without
+        -- pretending the system can self-rotate.
+}
+
+-- Audit
+--
+-- RotationAudited is emitted on every rotation attempt and outcome — a dispatch
+-- (the attempt), its success, failure or loss, and a recorded manual rotation
+-- (Goal 4). It is a pure sink: no rule chains from it. Durable, append-only,
+-- tamper-evident (WORM) storage is the existing Phase 1 audit log's job and is out
+-- of scope here; this spec models the event, not its persistence (mirroring
+-- pam.allium's LeaseActivationAudited). `source` carries why the rotation fired
+-- (scheduled / on_demand / access_end / reconnect) on every dispatch-derived
+-- outcome; `reason` is the daemon's failure_reason on a failed outcome; `actor` is
+-- the recording admin on a manual_recorded outcome (whose channel is implicit in
+-- the outcome). Each is absent where it does not apply.
+
+-- Invariants
+
+invariant OneRegistrationPerTargetSystem {
+    for a in TargetSystemRegistrations:
+        for b in TargetSystemRegistrations:
+            a != b implies a.target_system != b.target_system
+}
+
+invariant OneConfigPerCipherTarget {
+    for a in RotationConfigs:
+        for b in RotationConfigs:
+            a != b implies (a.cipher != b.cipher or a.target_system != b.target_system)
+}
+
+invariant AtMostOneInFlightDispatchPerConfig {
+    for rotation_config in RotationConfigs:
+        rotation_config.in_flight_dispatches.count <= 1
+}
+
+invariant AutomaticConfigTargetsCapableSystem {
+    -- An automatic configuration only ever sits on a system the daemon can rotate;
+    -- everything else must be managed manually.
+    for c in RotationConfigs where mode = automatic:
+        c.target_system.supports_automatic_rotation
+}
+
+invariant ManualConfigNeverDispatched {
+    -- A manual configuration is never sent to the daemon; its rotations are
+    -- recorded out of band. (Mode is fixed at creation in Phase 1 — see the
+    -- mode-switching open question.)
+    for c in RotationConfigs where mode = manual:
+        c.dispatches.count = 0
+}
+
+-- Surfaces
+
+surface RotationAdministration {
+    facing _: Administrator
+
+    provides:
+        RegisterTargetSystem(target_system)
+        CreateRotationConfig(cipher, target_system, account_identity, terminate_sessions, rotation_interval, mode, rotate_on_access_end)
+}
+
+surface TargetSystemRegistrationView {
+    facing _: Administrator
+    context registration: TargetSystemRegistration
+
+    exposes:
+        registration.target_system.name
+        registration.target_system.supports_automatic_rotation
+        registration.status
+
+    provides:
+        DisableTargetSystem(registration)
+            when registration.status = active
+        EnableTargetSystem(registration)
+            when registration.status = disabled
+}
+
+surface RotationConfigView {
+    -- A single rotation configuration: its schedule, mode, the standing
+    -- obligation for a manual config, and the actions available to an admin.
+    facing admin: Administrator
+    context rotation_config: RotationConfig
+
+    exposes:
+        rotation_config.cipher
+        rotation_config.target_system.name
+        rotation_config.account_identity
+        rotation_config.mode
+        rotation_config.enabled
+        rotation_config.rotate_on_access_end
+        rotation_config.rotation_interval
+        rotation_config.last_rotation_at
+        rotation_config.next_rotation_at
+        rotation_config.has_in_flight_dispatch
+        -- The flag that drives the manual-obligation prompt (Goal 3).
+        rotation_config.awaiting_manual_rotation
+
+    provides:
+        -- On-demand rotation for an automatic configuration (Goal 2).
+        TriggerRotation(admin, rotation_config)
+            when rotation_config.mode = automatic
+             and rotation_config.enabled
+             and not rotation_config.has_in_flight_dispatch
+        -- Record an out-of-band rotation for a manual configuration (Goal 3).
+        RecordManualRotation(admin, rotation_config)
+            when rotation_config.mode = manual
+}
+
+surface AccessEventIntake {
+    -- Inbound integration boundary: an upstream access-control system reports that
+    -- a grant over a managed credential has ended. Abstract by design — PAM, AAP
+    -- leasing or (later) Secrets Manager may all be the source.
+    facing _: AccessEventSource
+    context cipher: daemon/Cipher
+
+    provides:
+        AccessGrantEnded(cipher)
+}
+
+-- Open questions
+
+open question "Daemon authentication and connection establishment: how does a daemon authenticate and register its connection with the server? (Carried over from rotation-daemon.allium.)"
+open question "Multi-daemon routing: when more than one daemon is connected, how does the server choose which daemon receives a dispatch, and is recovery scoped per-daemon rather than to all in-flight dispatches?"
+open question "Reconcile task creation: both the daemon's OnTaskDispatched and the server's PerformDispatch model RotationTask creation. Confirm the server is authoritative and adjust the daemon's dispatch entry point accordingly."
+open question "Failure handling beyond rescheduling: should repeated rotation failures raise an alert, escalate, or disable the configuration after a threshold?"
+open question "Should disabling a target system or a configuration cancel in-flight dispatches, or only stop new ones?"
+open question "Manual obligation escalation: beyond surfacing awaiting_manual_rotation, should a manual configuration whose obligation stays unmet past a threshold escalate — notify, flag severity, or raise an alert?"
+open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...), and should the signal carry account_identity so it can disambiguate when one cipher backs configurations on multiple target systems? Today every opted-in automatic config for the cipher is rotated."
+open question "On-demand and access-triggered dispatches record a source on the TaskDispatch but not the triggering admin (only manual_recorded carries an actor). Should the audit attribute the on-demand actor end to end?"
+open question "Mode switching: can an admin move a configuration between automatic and manual after creation, and if so what becomes of its schedule and any in-flight dispatch? (ManualConfigNeverDispatched assumes mode is fixed at creation.)"
+open question "Secrets Manager support (Phase 1 non-goal): a future configuration would point at an SM secret rather than a daemon/Cipher. Confirm the dispatch, recovery, scheduling and audit machinery here carries an SM rotation task unchanged, and decide whether to generalise the cipher seam or add a parallel SM configuration."
