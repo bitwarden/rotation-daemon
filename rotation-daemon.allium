@@ -4,9 +4,11 @@
 -- Scope: Credential rotation daemon for Bitwarden
 -- Includes:
 --   Server connection lifecycle
---   Rotation attempt execution (one try at a rotation)
---   Target system integrations: Entra, MSSQL, CustomScript
---   Credential resolution for target system connections
+--   Rotation attempt execution (one try at a rotation), running the integration for the
+--     target-system kind (Entra, MSSQL, CustomScript) carried on the claim
+--   Resolving target-system connection details from daemon-local config, keyed by the
+--     target system's id. The server defines the target system and holds NO connection
+--     details (see rotation-server.allium / TargetSystem); the daemon supplies them.
 -- Excludes:
 --   Bitwarden server internals (external system)
 --   Bitwarden Secrets Manager internals (external system)
@@ -40,6 +42,11 @@ external entity Cipher {
 
 -- Value types
 
+-- The daemon's received copy of the password policy: the constraints a generated password
+-- must satisfy. The authoritative policy is server-side configuration on the TargetSystem
+-- (rotation-server.allium / PasswordPolicy); it is carried here on each claim. The daemon
+-- keeps its own copy of the shape only because it cannot reference server types (the one-way
+-- layering); the server owns what the policy IS.
 value PasswordPolicy {
     min_length: Integer
     max_length: Integer
@@ -49,35 +56,13 @@ value PasswordPolicy {
     include_symbols: Boolean
 }
 
--- Target systems
-
-entity TargetSystem {
-    id: String
-    name: String
-    kind: Entra | MSSQL | CustomScript
-    password_policy: PasswordPolicy
-    supports_session_termination: Boolean
-    -- Whether the daemon can rotate this system's credentials automatically.
-    -- Orthogonal to kind: a system may have no automated integration, or be one
-    -- the daemon cannot reach, and so must be rotated by hand. The server uses
-    -- this to constrain a rotation configuration's mode (see
-    -- rotation-server.allium / CreateRotationConfig and the manual fallback).
-    supports_automatic_rotation: Boolean
-}
-
-variant Entra : TargetSystem {
-    tenant_id: String
-}
-
-variant MSSQL : TargetSystem {
-    host: String
-    port: Integer
-    database: String?
-}
-
-variant CustomScript : TargetSystem {
-    command: String
-}
+-- Target systems are defined and owned server-side (rotation-server.allium / TargetSystem):
+-- the server holds the id, name, rotation method, kind and password policy, but NO
+-- connection details. When a rotation is claimed, the details the daemon needs to act are
+-- carried to it on the claim (RotationClaimed -> RotationAttempt fields below); the daemon
+-- resolves the actual connection details (host, username, password, ...) from its own local
+-- config, keyed by the target system's id. The Entra | MSSQL | CustomScript kind selects
+-- which integration the daemon runs.
 
 -- Rotation attempt
 -- One try at rotating a credential. The server creates an attempt when a daemon
@@ -87,7 +72,15 @@ variant CustomScript : TargetSystem {
 
 entity RotationAttempt {
     id: String
-    target_system: TargetSystem
+    -- Target-system details carried from the server on the claim (RotationClaimed). The
+    -- daemon never references the server's TargetSystem entity (layering); it works from
+    -- this snapshot and resolves connection details from local config by target_system_id.
+    target_system_id: String
+    target_system_name: String
+    -- Which integration the daemon runs (Entra, MSSQL, or a custom script).
+    kind: entra | mssql | custom_script
+    password_policy: PasswordPolicy
+    supports_session_termination: Boolean
     cipher: Cipher
     account_identity: String
     terminate_sessions: Boolean
@@ -209,7 +202,7 @@ actor BitwardenServer {
 }
 
 actor Integration {
-    identified_by: attempt.target_system.id
+    identified_by: attempt.target_system_id
 }
 
 -- Surfaces
@@ -377,9 +370,13 @@ rule ConnectionEstablished {
 -- Attempt execution
 
 rule StartRotation {
-    when: RotationClaimed(target_system, cipher, account_identity, terminate_sessions)
+    when: RotationClaimed(target_system_id, target_system_name, kind, password_policy, supports_session_termination, cipher, account_identity, terminate_sessions)
     ensures: RotationAttempt.created(
-        target_system: target_system,
+        target_system_id: target_system_id,
+        target_system_name: target_system_name,
+        kind: kind,
+        password_policy: password_policy,
+        supports_session_termination: supports_session_termination,
         cipher: cipher,
         account_identity: account_identity,
         terminate_sessions: terminate_sessions,
@@ -407,10 +404,13 @@ rule ExecuteRotation {
     requires: attempt.status = executing
     requires: exists session
     -- Steps performed in order:
-    -- 1. Resolve connection credentials for attempt.target_system
-    --    Priority: Bitwarden Secrets Manager → environment variables → local config
-    -- 2. Generate a new password satisfying attempt.target_system.password_policy
-    -- 3. Update the account identified by attempt.account_identity in the target system
+    -- 1. Resolve connection details for the target from daemon-local config, keyed by
+    --    attempt.target_system_id (e.g. "<id>.host", "<id>.username", "<id>.password").
+    --    Priority: Bitwarden Secrets Manager → environment variables → local config.
+    --    The server holds no connection details; only the daemon does.
+    -- 2. Generate a new password satisfying attempt.password_policy
+    -- 3. Run the attempt.kind integration to update the account identified by
+    --    attempt.account_identity in the target system
     -- 4. Read (GET) the cipher for this attempt, replace its password with the new
     --    value encrypted under session.organization_key (other fields ride along as
     --    opaque ciphertext -- not decrypted), and re-PUT the whole object to the
@@ -444,9 +444,9 @@ rule HandleRotationSucceeded {
     requires: attempt.status = executing
     ensures: attempt.status = succeeded
     ensures:
-        if attempt.terminate_sessions and attempt.target_system.supports_session_termination:
+        if attempt.terminate_sessions and attempt.supports_session_termination:
             SessionTermination.created(rotation_attempt: attempt, status: queued, attempt_count: 0)
-        if attempt.terminate_sessions and not attempt.target_system.supports_session_termination:
+        if attempt.terminate_sessions and not attempt.supports_session_termination:
             SessionTerminationUnsupported(attempt: attempt)
     @guidance
         -- Session termination is best-effort and decoupled from rotation success:
@@ -479,9 +479,10 @@ rule SessionTerminationReceived {
 rule ExecuteSessionTermination {
     when: ExecuteSessionTermination(termination)
     requires: termination.status = terminating
-    -- Terminate active sessions for termination.rotation_attempt.account_identity on
-    -- termination.rotation_attempt.target_system, using the same connection credentials
-    -- resolved for rotation (Secrets Manager → env vars → local config).
+    -- Terminate active sessions for termination.rotation_attempt.account_identity on the
+    -- target system (termination.rotation_attempt.target_system_id), using the same
+    -- connection details resolved for rotation from local config by id (Secrets Manager →
+    -- env vars → local config).
     -- Outcome reported by the SessionTerminationSurface via
     -- SessionTerminationSucceeded or SessionTerminationAttemptFailed.
 }
@@ -542,8 +543,9 @@ open question "Read blast radius (residual): the organization key remains the th
 open question "Cipher write granularity: with no partial-content API (Option A), rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the entire cipher (not just its password) and requires a read-before-write. A dedicated partial-update / rotate endpoint would remove the read and tighten write scope to the password field. A separate bearer write-token (a field on the job) would add defence in depth against an ownership-check bug. Both deferred."
 open question "Credential re-issuance: once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon?"
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
--- Resolved in rotation-server.allium: TargetSystem instances are registered and
--- managed server-side via TargetSystemRegistration.
+-- Resolved in rotation-server.allium: target systems are defined and managed server-side
+-- as the TargetSystem entity (id, name, method, kind, password policy), with no connection
+-- details; the daemon resolves those locally by id.
 -- Resolved in rotation-server.allium: a rotation is tracked server-side as a RotationJob;
 -- a job in flight when the claiming daemon's connection drops has its claim released --
 -- the same job returns to claimable after a backoff -- and a daemon re-claims it (a
