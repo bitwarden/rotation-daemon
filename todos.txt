@@ -1,0 +1,3 @@
+1. Done. I don't like the ReceiveGrant /grant terminilogy. We can maybe mention something similar in guidance that we do an extra oauth check/validation?
+2. Done. DaemonSession vs ServerConnection, what is that? I also think the ServerConnection status can be terminal, e.g. if auth is rejected we shouldn't retry in all eternity. 
+3. Maybe simplify / don't over index on the connection. We'll use websockets and signalr, so we should defined the outlines of what happens on connect etc, but don't overdo it.

@@ -18,9 +18,14 @@
 --     fresh attempt the server makes claimable again.
 
 config {
-    -- Retry budget for SESSION TERMINATION only. Rotation retries are orchestrated
-    -- server-side (a failed attempt makes the job claimable again); session
-    -- termination keeps its own independent retry loop here.
+    -- The daemon's small, local retry budget for absorbing TRANSIENT glitches within
+    -- a single attempt -- a brief network blip or a momentary target-system error --
+    -- so a temporary fault does not bubble up as an attempt failure. It covers the
+    -- target-integration and cipher calls during a rotation (see ExecuteRotation) and
+    -- the session-termination loop (see RetrySessionTermination). This is deliberately
+    -- small and is DISTINCT from the server's attempt-level retry: a hard failure that
+    -- survives these local retries is reported to the server, which makes the job
+    -- claimable again for a fresh attempt (rotation-server.allium / RetryJob).
     max_retry_attempts: Integer = 5
     retry_base_delay: Duration = 1.second
 }
@@ -122,15 +127,30 @@ entity SessionTermination {
 }
 
 -- Server connection
+-- The transport: the daemon's (WebSocket-like) link to the Bitwarden server. This is the
+-- link lifecycle only -- establishing it, losing it, reconnecting -- and is separate from
+-- DaemonSession, the authenticated session (access token, organization key, refresh and
+-- revoke) that rides on top of an established connection. The link can drop and reconnect
+-- many times within the life of one credential, and the access token expires and refreshes
+-- independently of the link. A transient drop (disconnected) reconnects with backoff; a
+-- connection whose authentication is rejected is terminally refused -- the credential is
+-- no good, so the daemon stops rather than reconnecting forever against it (a replacement
+-- credential must be provisioned; see the credential re-issuance open question).
+--
+-- SignalR/WebSockets owns the raw transport: socket setup, keep-alive, and reconnection
+-- with backoff are the library's job, not the daemon's. This entity models only the
+-- outline the daemon's own logic depends on (am I connected? authenticated? do I need to
+-- re-auth or stop?), deliberately not the connection mechanics.
 
 entity ServerConnection {
-    status: connecting | connected | disconnected
+    status: connecting | connected | disconnected | refused
 
     transitions status {
         connecting -> connected
-        connecting -> disconnected
+        connecting -> refused
         connected -> disconnected
         disconnected -> connecting
+        terminal: refused
     }
 }
 
@@ -157,6 +177,12 @@ given {
     credential: DaemonCredential
 }
 
+-- The authenticated session that rides on a ServerConnection: it holds the short-lived
+-- access token and the decrypted organization key, and tracks the credential lifecycle
+-- (authenticate -> active, expire -> refresh, or revoke). Distinct from ServerConnection,
+-- which is just the transport: one session is established per connection attempt
+-- (DaemonConnects), and the connection is only signalled ready once this session
+-- authenticates (HandleAuthenticationSucceeded -> OpenConnection).
 entity DaemonSession {
     id: String
     connection: ServerConnection
@@ -284,7 +310,13 @@ rule OpenConnection {
 rule RefuseConnection {
     when: ConnectionRefused(connection)
     requires: connection.status = connecting
-    ensures: connection.status = disconnected
+    ensures: connection.status = refused
+    @guidance
+        -- Authentication was rejected -- a bad or revoked credential. The connection is
+        -- terminally refused: unlike a transient drop (which Reconnect retries with
+        -- backoff), the daemon does NOT reconnect, because re-presenting the same rejected
+        -- credential would just loop forever. A replacement credential must be provisioned
+        -- before the daemon can connect again (see the credential re-issuance open question).
 }
 
 rule SessionExpires {
@@ -328,7 +360,10 @@ rule Reconnect {
     requires: connection.status = disconnected
     ensures: connection.status = connecting
     @guidance
-        -- Reconnection attempts use exponential backoff.
+        -- The outline of a reconnect: a dropped transport returns to connecting and
+        -- re-authenticates. The mechanics -- re-establishing the socket, keep-alive, and
+        -- the exponential backoff between attempts -- belong to SignalR/WebSockets, not
+        -- the daemon; this rule does not re-specify them.
 }
 
 rule ConnectionEstablished {
@@ -341,8 +376,8 @@ rule ConnectionEstablished {
 
 -- Attempt execution
 
-rule ReceiveGrant {
-    when: RotationGranted(target_system, cipher, account_identity, terminate_sessions)
+rule StartRotation {
+    when: RotationClaimed(target_system, cipher, account_identity, terminate_sessions)
     ensures: RotationAttempt.created(
         target_system: target_system,
         cipher: cipher,
@@ -352,8 +387,9 @@ rule ReceiveGrant {
     )
     @guidance
         -- The daemon's claim succeeded (rotation-server.allium / ClaimRotation) and the
-        -- server granted it the work details for the job it claimed. The daemon creates
-        -- its own attempt from them. A retry is a fresh grant for a fresh attempt.
+        -- server answered it with the work details for the job it claimed. The daemon
+        -- starts the rotation by creating its own attempt from those details. A retry is
+        -- another claim, answered with fresh details, for a fresh attempt.
 }
 
 rule ReceiveAttempt {
@@ -380,7 +416,7 @@ rule ExecuteRotation {
     --    opaque ciphertext -- not decrypted), and re-PUT the whole object to the
     --    server, referencing the job (today's API has no partial-content write). The
     --    daemon reads only this one cipher -- no general cipher-read scope (see
-    --    rotation-server.allium / CipherWriteIntake, ApiScopedReads). The server
+    --    rotation-server.allium / CipherWriteback, ApiScopedReads). The server
     --    authorises the write against its in-flight job for the attempt -- no separate
     --    nonce (AcceptCipherUpdate) -- and only ever stores ciphertext (ServerZeroKnowledge).
     -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed.
@@ -393,6 +429,14 @@ rule ExecuteRotation {
         -- Each attempt is independent and starts from step 1: a fresh password is
         -- generated and both the target system and cipher are updated together, so a
         -- previous attempt's partial failure never leaves them out of sync.
+        --
+        -- Transient faults are absorbed locally: a step that fails with a transient
+        -- error (a network blip, a momentary target-system or API error) is retried in
+        -- place up to config.max_retry_attempts with a config.retry_base_delay backoff
+        -- before the attempt is reported failed. This keeps a brief glitch from costing
+        -- a whole server round-trip. RotationAttemptFailed is emitted only once these
+        -- local retries are exhausted (or the error is plainly non-transient); the
+        -- server's re-claim is the outer retry for failures that survive them.
 }
 
 rule HandleRotationSucceeded {
@@ -483,7 +527,7 @@ invariant AtMostOneActiveSession {
 -- Resolved (design): the daemon holds the organization key (from authentication) to
 -- encrypt cipher writes, but each write is authorised against the server's own in-flight
 -- RotationJob for the rotation -- no separate nonce (see rotation-server.allium /
--- AcceptCipherUpdate, CipherWriteIntake). A write is accepted only for a job that
+-- AcceptCipherUpdate, CipherWriteback). A write is accepted only for a job that
 -- belongs to this daemon, is in-flight and within its window, and targets the job's
 -- cipher, so writes are tightly scoped to the specific rotated cipher and window. The
 -- read blast radius of holding the org key is contained at the API authorization layer:
@@ -501,5 +545,6 @@ open question "Custom script result format: exit code, stdout parsing, or struct
 -- Resolved in rotation-server.allium: TargetSystem instances are registered and
 -- managed server-side via TargetSystemRegistration.
 -- Resolved in rotation-server.allium: a rotation is tracked server-side as a RotationJob;
--- a job in flight when the connection drops is marked lost and made due again, and a
--- daemon re-claims it (a fresh attempt) once connected.
+-- a job in flight when the claiming daemon's connection drops has its claim released --
+-- the same job returns to claimable after a backoff -- and a daemon re-claims it (a
+-- fresh attempt) once connected.

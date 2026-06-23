@@ -8,7 +8,7 @@ use "./rotation-daemon.allium" as daemon
 --   Target system registration and management
 --   Rotation configuration (linking a cipher to a target system) and its rotation
 --     settings: the triggers that cause a rotation (an optional schedule and the
---     rotate-on-access-end opt-in), set per credential or applied across a collection
+--     rotate-on-access-end opt-in), set per credential
 --   Rotation scheduling and triggering: on a schedule (cron), on demand, and on
 --     access events (an upstream grant over the credential ending)
 --   Manual rotation fallback for systems that cannot be rotated automatically:
@@ -28,7 +28,8 @@ use "./rotation-daemon.allium" as daemon
 --   The daemon authentication handshake and session lifecycle (modelled in
 --     rotation-daemon.allium); this spec covers only daemon registration/revocation
 --   Cron-expression parsing / next-occurrence computation (deferred NextScheduledTime)
---   Collection membership resolution (deferred CollectionCredentials)
+--   Collection-wide settings (applying one set of rotation settings across a whole
+--     collection at once) — deferred; settings are per-credential for now
 --   Failure-handling policy beyond a near-term retry — alerting, auto-disable — which
 --     is §6.8 (not yet specified here; RotationFailed is the seam)
 --   Bitwarden cipher/Secrets Manager internals (external systems)
@@ -65,15 +66,10 @@ config {
 -- authentication are governed by the Bitwarden platform, outside this spec.
 external entity Administrator {}
 
--- A Bitwarden collection. Referenced only so rotation settings can be applied
--- across all managed credentials in it (see ApplyRotationSettingsToCollection);
--- its contents and membership are owned by the Bitwarden platform.
-external entity Collection {}
-
 -- An upstream access-control system (PAM leasing, AAP grants, ...) that reports
 -- when a grant over a managed credential ends. Modelled as an abstract integration
 -- party so rotation depends on the access-event signal, not on any one leasing
--- spec. See AccessEventIntake and RotateOnAccessEnd.
+-- spec. See AccessEventReporting and RotateOnAccessEnd.
 actor AccessEventSource {
     identified_by: cipher.id
 }
@@ -87,9 +83,9 @@ value Schedule {
     cron: String
 }
 
--- The triggers that cause a credential to rotate, grouped so they can be set on one
--- credential or applied across a collection as a unit. On-demand rotation is always
--- available and so is not a stored setting.
+-- The triggers that cause a credential to rotate, grouped so they can be set on a
+-- credential as a unit. On-demand rotation is always available and so is not a stored
+-- setting.
 --   schedule: the optional schedule trigger. Absent => no scheduled rotation; the
 --     credential still rotates on demand or on an access event.
 --   rotate_on_access_end: opt-in to the access-event trigger (Goal 2).
@@ -186,7 +182,7 @@ entity RotationConfig {
     --   tracked and surfaced for an admin to satisfy out of band (Goal 3).
     mode: automatic | manual
     -- The rotation triggers for this credential (schedule + access-end opt-in). Set
-    -- individually or applied across a collection; last write wins.
+    -- per credential; last write wins.
     settings: RotationSettings
     -- The next scheduled rotation, derived from settings.schedule. Absent when there
     -- is no schedule, so RotationDue (a temporal trigger) never fires for it.
@@ -213,21 +209,24 @@ entity RotationConfig {
 --   claimed   : a daemon claimed it and is making an attempt
 --   succeeded : an attempt succeeded
 --   failed    : every attempt failed (max_attempts reached)
---   lost      : the claiming daemon's connection dropped mid-attempt
 --   timed_out : still unresolved past the deadline (unroutable, or a stuck daemon)
--- A failed attempt with retries left returns the job to pending (a re-claim makes the
--- next attempt) -- that is the claimed -> pending edge.
+-- The single recovery path is the claimed -> pending edge: the job returns to
+-- claimable and a re-claim makes the next attempt. It is taken both when an attempt
+-- fails with retries left (RetryJob, after a backoff) and when the claiming daemon's
+-- connection drops mid-attempt (ReleaseJob -- the claim is released so another daemon,
+-- or the same one on reconnect, can re-claim). There is no separate "lost" state: a
+-- daemon drop is just another reason the job becomes claimable again.
 entity RotationJob {
     id: String
     rotation_config: RotationConfig
     source: scheduled | on_demand | access_end
     -- The daemon currently handling the job; null while pending (unclaimed), set on
-    -- each claim, cleared on a retry. Recovery is scoped by it.
-    daemon: DaemonRegistration?
+    -- each claim, cleared on a retry or release. Recovery is scoped by it.
+    claimed_by: DaemonRegistration?
     -- Attempts made so far (incremented on each claim). The job fails once
     -- max_attempts attempts have failed.
     attempt_count: Integer
-    status: pending | claimed | succeeded | failed | lost | timed_out
+    status: pending | claimed | succeeded | failed | timed_out
     created_at: Timestamp
     -- When the job (re)becomes claimable: now at creation, pushed out by a backoff
     -- after a failed attempt so retries are spaced.
@@ -244,9 +243,8 @@ entity RotationJob {
         claimed -> pending
         claimed -> succeeded
         claimed -> failed
-        claimed -> lost
         claimed -> timed_out
-        terminal: succeeded, failed, lost, timed_out
+        terminal: succeeded, failed, timed_out
     }
 }
 
@@ -255,11 +253,6 @@ entity RotationJob {
 -- The next occurrence of a schedule strictly after a given time. Encapsulates
 -- cron-expression evaluation, which is an implementation concern.
 deferred NextScheduledTime    -- see: server-side cron evaluation
-
--- The managed credentials (rotation configurations) reachable through a collection,
--- resolved from the ciphers in that collection. Used to apply rotation settings
--- across a collection.
-deferred CollectionCredentials    -- see: server-side collection membership resolution
 
 -- Daemon registration
 
@@ -406,20 +399,6 @@ rule UpdateRotationSettings {
         -- with no scheduled rotation; on-demand and access-event triggers still work.
 }
 
-rule ApplyRotationSettingsToCollection {
-    when: ApplyRotationSettingsToCollection(_, collection, settings)
-    for rotation_config in CollectionCredentials(collection):
-        let next = if settings.schedule != null: NextScheduledTime(settings.schedule, now)
-                   else: null
-        ensures: rotation_config.settings = settings
-        ensures: rotation_config.next_rotation_at = next
-    @guidance
-        -- Apply the same rotation settings across every managed credential in a
-        -- collection (FR3). Settings are copied onto each credential — there is no
-        -- shared template, so a later individual edit simply overrides that one
-        -- credential. Recomputes each next scheduled time immediately.
-}
-
 rule PauseRotation {
     when: PauseRotation(_, rotation_config)
     requires: rotation_config.enabled
@@ -496,7 +475,7 @@ rule RotateOnAccessEnd {
         -- rotation configuration (OneConfigPerCipher) is offered, if it is automatic
         -- and opted in. The cipher alone resolves the configuration, so the signal
         -- carries no account identity. The signal is intentionally abstract
-        -- (AccessEventIntake): rotation depends on the event, not on any particular
+        -- (AccessEventReporting): rotation depends on the event, not on any particular
         -- leasing spec, so PAM, AAP leasing or a future Secrets Manager can all emit it.
 }
 
@@ -540,9 +519,9 @@ rule ClaimRotation {
     requires: exists DaemonTargetAssignment{daemon: claimer, target_system: job.rotation_config.target_system}
     let cfg = job.rotation_config
     ensures: job.status = claimed
-    ensures: job.daemon = claimer
+    ensures: job.claimed_by = claimer
     ensures: job.attempt_count = job.attempt_count + 1
-    ensures: RotationGranted(
+    ensures: RotationClaimed(
         target_system: cfg.target_system,
         cipher: cfg.cipher,
         account_identity: cfg.account_identity,
@@ -550,13 +529,20 @@ rule ClaimRotation {
     )
     ensures: RotationAudited(rotation_config: cfg, outcome: dispatched, source: job.source)
     @guidance
-        -- An eligible daemon takes the job; the server marks it claimed and grants the
-        -- work details (RotationGranted), from which the daemon creates the attempt it
-        -- executes (rotation-daemon.allium / ReceiveGrant). attempt_count rises per
+        -- An eligible daemon takes the job; the server marks it claimed and answers with
+        -- the work details (RotationClaimed), from which the daemon creates the attempt it
+        -- executes (rotation-daemon.allium / StartRotation). attempt_count rises per
         -- claim. First claim wins: the guard requires the job still pending, so a second
         -- concurrent claim finds it claimed and fails. The attempt is correlated back to
         -- this job via the cipher's configuration (RotationConfig{cipher} -> the config's
         -- single claimed job), so no back-reference from attempt to job is needed.
+        --
+        -- The claim arrives over the daemon's authenticated channel, but the server does
+        -- not trust the persistent connection alone: it re-validates the claimant's OAuth
+        -- access token (the client-credentials bearer token from authentication, tied to a
+        -- still-active session) as it accepts the claim. This extra check at claim time
+        -- means a daemon whose token has expired or whose credential was revoked cannot
+        -- claim even if its connection still looks up.
 }
 
 -- Job tracking (observed from the daemon's attempt outcomes) and retry orchestration.
@@ -586,7 +572,7 @@ rule RetryJob {
     requires: exists job
     requires: job.attempt_count < config.max_attempts
     ensures: job.status = pending
-    ensures: job.daemon = null
+    ensures: job.claimed_by = null
     ensures: job.next_claimable_at = now + config.retry_base_delay
     ensures: RotationAudited(rotation_config: cfg, outcome: attempt_failed, source: job.source, reason: attempt.failure_reason)
     @guidance
@@ -633,32 +619,40 @@ rule JobTimesOut {
 
 -- Recovery
 
-rule DaemonConnectionDropsLoseJobs {
+rule DaemonConnectionDropsReleaseJobs {
     when: connection: DaemonConnection.status transitions_to disconnected
-    for job in RotationJobs where daemon = connection.daemon and status = claimed:
-        ensures: JobLost(job: job)
+    for job in RotationJobs where claimed_by = connection.daemon and status = claimed:
+        ensures: ReleaseJob(job: job)
     @guidance
-        -- Per-daemon recovery: only jobs claimed by the daemon whose connection
-        -- dropped are lost (RotationJob.daemon scopes it); other daemons' jobs are
-        -- untouched. Each lost job's config is made due again (MarkJobLost), so a fresh
-        -- job is offered and another connected assigned daemon can claim it.
+        -- Per-daemon recovery: only jobs claimed by the daemon whose connection dropped
+        -- are released (RotationJob.claimed_by scopes it); other daemons' jobs are untouched.
+        -- Each released job returns to claimable (ReleaseJob), so another connected
+        -- assigned daemon -- or this one on reconnect -- can re-claim it.
 }
 
-rule MarkJobLost {
-    when: JobLost(job)
+rule ReleaseJob {
+    when: ReleaseJob(job)
     requires: job.status = claimed
     let cfg = job.rotation_config
-    ensures: job.status = lost
-    ensures: cfg.next_rotation_at = now
-    ensures: RotationAudited(rotation_config: cfg, outcome: lost, source: job.source)
+    ensures: job.status = pending
+    ensures: job.claimed_by = null
+    ensures: job.attempt_count = job.attempt_count - 1
+    ensures: job.next_claimable_at = now + config.retry_base_delay
+    ensures: RotationAudited(rotation_config: cfg, outcome: released, source: job.source)
     @guidance
-        -- The daemon holding this job dropped. The job is lost and the config made due
-        -- now, so RotationDue offers a fresh job that another assigned daemon can claim.
+        -- The daemon holding this job dropped before reporting an outcome, so its claim
+        -- is released: the same job returns to claimable (pending) after a backoff, and
+        -- any connected assigned daemon re-claims it for a fresh attempt. The claim is
+        -- undone rather than counted -- attempt_count is decremented back -- so losing
+        -- connectivity is not charged against the retry budget (a genuine attempt failure
+        -- is, via RetryJob). This is the same claimed -> pending recovery edge as a retry;
+        -- a daemon drop is simply another reason to take it. The job_ttl deadline
+        -- (JobTimesOut) remains the backstop for a job that never resolves at all.
 }
 
 -- Cipher write authorisation
 --
--- The daemon writes the rotated, encrypted password back to a cipher (CipherWriteIntake)
+-- The daemon writes the rotated, encrypted password back to a cipher (CipherWriteback)
 -- over its authenticated channel, referencing the attempt it is executing. There is no
 -- separate write token: the server's own claimed RotationJob for that cipher is the
 -- capability. A write is accepted only against a job claimed by this daemon; an invalid
@@ -670,7 +664,7 @@ rule AcceptCipherUpdate {
     let cfg = RotationConfig{cipher: attempt.cipher}
     let job = RotationJob{rotation_config: cfg, status: claimed}
     requires: exists job
-    requires: job.daemon = writer
+    requires: job.claimed_by = writer
     ensures: attempt.cipher.password = new_password
     @guidance
         -- The write is a full-object PUT (no partial-content API): the daemon resends
@@ -678,20 +672,22 @@ rule AcceptCipherUpdate {
         -- attempt.cipher.password = new_password is the intended net change. new_password
         -- is ciphertext the daemon encrypted with the organization key; the server
         -- persists it without decrypting (zero-knowledge). The claimed job IS the
-        -- capability -- ownership (job.daemon) and claimed (in-flight) status authorise
-        -- it, with no separate nonce. A timed-out / lost / completed job is no longer
-        -- claimed, so a stale write is refused (RejectCipherUpdate).
+        -- capability -- ownership (job.claimed_by) and claimed (in-flight) status authorise
+        -- it, with no separate nonce. A completed, timed-out, or released job (or one
+        -- re-claimed by another daemon) is no longer claimed by this writer, so a stale
+        -- write is refused (RejectCipherUpdate).
 }
 
 rule RejectCipherUpdate {
     when: SubmitCipherUpdate(writer, attempt, new_password)
     let cfg = RotationConfig{cipher: attempt.cipher}
     let job = RotationJob{rotation_config: cfg, status: claimed}
-    requires: not exists job or job.daemon != writer
+    requires: not exists job or job.claimed_by != writer
     ensures: RotationAudited(rotation_config: cfg, outcome: write_rejected)
     @guidance
-        -- Refused: there is no claimed job for this cipher (it completed, timed out or
-        -- was lost), or the claimed job belongs to a different daemon. The daemon
+        -- Refused: there is no claimed job for this cipher (it completed, timed out, or
+        -- its claim was released by a daemon drop), or the claimed job belongs to a
+        -- different daemon. The daemon
         -- surfaces this as a failed attempt (rotation-daemon.allium / MarkAttemptFailed);
         -- if the job has retries left it becomes claimable again for a fresh attempt.
 }
@@ -720,8 +716,9 @@ rule RecordManualRotation {
 --
 -- RotationAudited is emitted on every rotation attempt and outcome — a claim (the
 -- attempt, dispatched), its success (succeeded), a failed attempt that will be retried
--- (attempt_failed), final failure (failed), loss (lost), timeout (timed_out), a refused
--- cipher write (write_rejected), and a recorded manual rotation (manual_recorded)
+-- (attempt_failed), final failure (failed), a released claim after a daemon drop
+-- (released), timeout (timed_out), a refused cipher write (write_rejected), and a
+-- recorded manual rotation (manual_recorded)
 -- (Goal 4). It is a pure sink: no rule chains from it. Durable, append-only,
 -- tamper-evident (WORM) storage is the existing Phase 1 audit log's job and is out
 -- of scope here; this spec models the event, not its persistence (mirroring
@@ -795,16 +792,6 @@ surface RotationAdministration {
         RegisterDaemon(name, client_id)
         RegisterTargetSystem(target_system)
         CreateRotationConfig(cipher, target_system, account_identity, terminate_sessions, mode, settings)
-}
-
-surface CollectionRotationView {
-    -- Apply one set of rotation settings across every managed credential in a
-    -- collection (FR3) — the bulk path complementing per-credential editing.
-    facing admin: Administrator
-    context collection: Collection
-
-    provides:
-        ApplyRotationSettingsToCollection(admin, collection, settings)
 }
 
 surface DaemonRegistrationView {
@@ -899,7 +886,7 @@ surface RotationScheduleListView {
             c.awaiting_manual_rotation
 }
 
-surface AccessEventIntake {
+surface AccessEventReporting {
     -- Inbound integration boundary: an upstream access-control system reports that
     -- a grant over a managed credential has ended. Abstract by design — PAM, AAP
     -- leasing or (later) Secrets Manager may all be the source.
@@ -923,7 +910,10 @@ surface RotationWork {
     @guarantee EligibleClaimsOnly
         -- A claim is accepted only for a pending, still-claimable job whose target the
         -- daemon is enrolled, connected and assigned to rotate (ClaimRotation enforces
-        -- all of these). The assignment is the eligibility/security boundary.
+        -- all of these). The assignment is the eligibility/security boundary. The claim is
+        -- also re-authenticated: the server validates the daemon's OAuth access token on
+        -- the request (defence in depth beyond the persistent connection), so an expired
+        -- or revoked credential cannot claim.
 
     @guidance
         -- Pull with a push nudge: the server notifies eligible (connected, assigned)
@@ -932,7 +922,7 @@ surface RotationWork {
         -- whichever eligible daemon claims first, and a busy daemon simply does not claim.
 }
 
-surface CipherWriteIntake {
+surface CipherWriteback {
     -- The daemon writes a rotated password back to a cipher over its authenticated
     -- channel, referencing the attempt it is executing. Today's API has no partial-content
     -- update, so the daemon GETs the cipher, swaps in the newly-encrypted password
@@ -947,7 +937,7 @@ surface CipherWriteIntake {
 
     @guarantee JobBoundWrite
         -- A cipher write is accepted only against a RotationJob claimed by this daemon
-        -- (job.daemon = writer) for the attempt's cipher. The target is the attempt's
+        -- (job.claimed_by = writer) for the attempt's cipher. The target is the attempt's
         -- cipher, so the daemon cannot redirect the write elsewhere. new_password is
         -- ciphertext encrypted with the organization key; the server stores it without
         -- decrypting (zero-knowledge). Because the write is a full-object PUT (no
@@ -990,18 +980,19 @@ surface DaemonConnectivity {
 -- which creates the attempt it executes. A retry is a re-claim: a failed attempt with
 -- budget left returns the job to pending after a backoff (RetryJob). Eligibility is by
 -- admin-assigned reachability (DaemonTargetAssignment); recovery is per-daemon (a
--- dropped daemon's claimed jobs are lost and re-offered).
+-- dropped daemon's claimed jobs are released back to claimable for re-claim).
 -- Resolved: task creation is unambiguously server-side -- the server creates the
 -- RotationAttempt when a daemon claims a job (ClaimRotation). The daemon no longer
 -- creates tasks.
 open question "Failure handling (§6.8): FailJob and JobTimesOut reschedule to a near-term retry and emit RotationFailed as the seam. §6.8 should define the real policy — alerting and auto-disable after a threshold — and take ownership of next_rotation_at on terminal failure."
+open question "Collection-wide settings (deferred): applying one set of rotation settings across every managed credential in a collection at once. Deferred to keep Phase 1 per-credential -- the per-credential UpdateRotationSettings path stands in. Revisit with the collection-membership resolution it needs."
 open question "Non-cron cadences: Schedule carries a cron expression for exact timing. Do interval-style presets (e.g. 'every 90 days') need a separate representation, or are all supported presets expressible as cron?"
 open question "Rotation throttling: many credentials on one target coming due together could hammer that target or connector. Not modelled here (no fleet-scale deployment assumed); if needed, throttle in the daemon/connector rather than the server scheduler."
 open question "Unroutable-job escalation: a job that stays pending because no eligible daemon is connected/assigned currently waits until claimed or until JobTimesOut. Past a threshold it should escalate to an operator; delivery shares the unspecified alerting seam with manual-obligation escalation and §6.8 failure handling."
 open question "Daemon connectivity edges: MarkDaemonConnected/Disconnected react to server-observed DaemonConnected/DaemonDisconnected stimuli. Reconcile which daemon-side transitions (rotation-daemon.allium ServerConnection / DaemonSession) raise each edge — in particular whether a session expiry that is not a transport drop counts as disconnected for claim eligibility."
 open question "Should disabling a target system, pausing a configuration, applying new settings, or unassigning a daemon cancel a claimed job, or only stop new ones being offered? (Today all only stop new ones.)"
 open question "Manual obligation escalation: beyond surfacing awaiting_manual_rotation, should a manual configuration whose obligation stays unmet past a threshold escalate — notify, flag severity, or raise an alert?"
-open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...)? The signal-shape question is resolved — it carries only the cipher, which uniquely resolves the configuration to rotate (OneConfigPerCipher), so no account_identity is needed — but the concrete set of emitters and how they register against AccessEventIntake is still open."
+open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...)? The signal-shape question is resolved — it carries only the cipher, which uniquely resolves the configuration to rotate (OneConfigPerCipher), so no account_identity is needed — but the concrete set of emitters and how they register against AccessEventReporting is still open."
 open question "On-demand and access-triggered jobs record a source but not the triggering admin (only manual_recorded carries an actor). Should the audit attribute the on-demand actor end to end?"
 open question "Mode switching: can an admin move a configuration between automatic and manual after creation, and if so what becomes of its schedule and any active job? (ManualConfigNeverJobbed assumes mode is fixed at creation.)"
 open question "Secrets Manager support (Phase 1 non-goal): a future configuration would point at an SM secret rather than a daemon/Cipher. Confirm the offer, claim, recovery, scheduling and audit machinery here carries an SM rotation unchanged, and decide whether to generalise the cipher seam or add a parallel SM configuration."
