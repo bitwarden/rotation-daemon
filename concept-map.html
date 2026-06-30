@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bitwarden Credential Rotation — Concept Map</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --panel-2: #1c212b;
+    --ink: #e7ebf2;
+    --ink-dim: #aab3c2;
+    --ink-faint: #7d8798;
+    --line: #29303d;
+    --brand: #4a7dff;
+    --brand-2: #7aa2ff;
+    --accent: #00c2a8;
+    --warn: #ffb74d;
+    --danger: #ff6b6b;
+    --good: #4cd07d;
+    --code-bg: #0b0d12;
+    --radius: 12px;
+    --maxw: 980px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--brand-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-size: 0.86em; }
+  code.r {
+    background: var(--code-bg); color: #c8d4ff; border: 1px solid var(--line);
+    border-radius: 6px; padding: 0.08em 0.4em; white-space: nowrap;
+  }
+  code.r.ent { color: #ffd98a; }
+  code.r.sur { color: #9be8d8; }
+  code.r.trig { color: #f3a6ff; }
+
+  main { max-width: var(--maxw); margin: 0 auto; padding: 40px 38px 120px; }
+  header.hero { padding: 14px 0 30px; border-bottom: 1px solid var(--line); margin-bottom: 36px; }
+  header.hero .eyebrow { text-transform: uppercase; letter-spacing: 2px; font-size: 11.5px; color: var(--accent); font-weight: 700; }
+  header.hero h1 { font-size: 33px; line-height: 1.15; margin: 10px 0 8px; letter-spacing: -.5px; }
+  header.hero p.lede { color: var(--ink-dim); font-size: 17px; max-width: 72ch; margin: 0; }
+  .srcrow { display:flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+  .srcrow .pill { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 5px 13px; font-size: 12.5px; color: var(--ink-dim); }
+  .srcrow .pill b { color: var(--ink); }
+
+  section { margin: 0 0 50px; }
+  h2 { font-size: 24px; letter-spacing: -.3px; margin: 0 0 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  h2 .num { color: var(--brand); font-weight: 700; margin-right: 10px; }
+  h3 { font-size: 17px; margin: 28px 0 6px; color: var(--brand-2); }
+  p { margin: 10px 0; }
+  ul { padding-left: 22px; }
+  li { margin: 6px 0; }
+  .muted { color: var(--ink-dim); }
+
+  .callout { border-left: 3px solid var(--brand); background: var(--panel-2); padding: 12px 16px; border-radius: 0 10px 10px 0; margin: 16px 0; }
+  .callout.good { border-left-color: var(--good); }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout .lbl { font-weight: 700; font-size: 12px; letter-spacing: .6px; text-transform: uppercase; color: var(--brand-2); }
+  .callout.good .lbl { color: var(--good); }
+  .callout.warn .lbl { color: var(--warn); }
+
+  /* Mermaid — kept simple: diagrams fit the column and stay legible */
+  .diagram { background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px 18px; margin: 16px 0; text-align: center; }
+  .diagram .cap { text-align: left; color: var(--ink-faint); font-size: 12.5px; margin-top: 14px; padding-top: 8px; border-top: 1px dashed var(--line); }
+  .mermaid { display: inline-block; min-width: 100%; }
+
+  /* Tables */
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--brand-2); font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: .5px; }
+  tbody tr:hover { background: var(--panel); }
+  td .dir { font-family: "SF Mono", monospace; font-size: 12px; color: var(--accent); white-space: nowrap; }
+
+  .backlink { font-size: 13px; color: var(--ink-faint); margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="eyebrow">Bitwarden Credential Rotation</div>
+    <h1>Concept Map</h1>
+    <p class="lede">
+      Two specifications, one system. The Bitwarden server decides <em>what &amp; when</em>;
+      the rotation daemon does the <em>how</em>. They meet at a narrow API.
+    </p>
+    <div class="srcrow">
+      <span class="pill">Server: <b>rotation-server.allium</b></span>
+      <span class="pill">Daemon: <b>rotation-daemon.allium</b></span>
+    </div>
+    <div class="backlink">See also: <a href="spec-report.html">full system report →</a></div>
+  </header>
+
+  <section id="parts">
+    <h2><span class="num">1</span>The big picture</h2>
+    <p class="muted">An admin configures rotations on the server. The daemon does the work in the target system. Everything between server and daemon is the API.</p>
+    <div class="diagram">
+      <div class="mermaid">
+flowchart LR
+  Admin(["Administrator"]) -->|configures| Server["Bitwarden server"]
+  Server -->|offers &amp; authorises work| Daemon["Rotation daemon"]
+  Daemon -->|claims · writes back · reports| Server
+  Daemon -->|rotates credential| Target(["Target system"])
+      </div>
+      <div class="cap">The two arrows between server and daemon <em>are</em> the API. Section&nbsp;3 lists exactly what crosses.</div>
+    </div>
+  </section>
+
+  <section id="spine">
+    <h2><span class="num">2</span>The rotation lifecycle</h2>
+    <p class="muted">One rotation, end to end. A server-side job spawns a daemon-side attempt; the attempt writes the new password and reports back.</p>
+    <div class="diagram">
+      <div class="mermaid">
+flowchart LR
+  Config["RotationConfig"] -->|comes due| Job["RotationJob<br/>server"]
+  Job -->|daemon claims| Attempt["RotationAttempt<br/>daemon"]
+  Attempt -->|writes new password| Cipher[("Cipher")]
+  Attempt -.->|reports outcome| Job
+      </div>
+      <div class="cap">The <code class="r ent">RotationJob</code>&nbsp;&harr;&nbsp;<code class="r ent">RotationAttempt</code> pair is the spine: the job is durable and counts attempts; the attempt is one try. A failed attempt makes the job claimable again.</div>
+    </div>
+  </section>
+
+  <section id="seam">
+    <h2><span class="num">3</span>The API seam, precisely</h2>
+    <p class="muted">Every place the two parts touch. Everything else is internal to one spec.</p>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Interaction</th><th>Direction</th><th>Mechanism</th><th>What crosses</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td><b>Authenticate</b></td>
+          <td><span class="dir">daemon &rarr; server</span></td>
+          <td>OAuth2 client-credentials; <code class="r sur">AuthenticationSucceeded/Rejected</code>, <code class="r sur">SessionRevoked</code></td>
+          <td><code class="r ent">DaemonCredential</code> &harr; <code class="r ent">DaemonRegistration</code>; org key returned <b>encrypted</b> (zero-knowledge)</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><b>Connectivity</b></td>
+          <td><span class="dir">daemon &rarr; server</span></td>
+          <td><code class="r sur">DaemonConnected</code> / <code class="r sur">DaemonDisconnected</code></td>
+          <td>daemon <code class="r ent">ServerConnection</code> state &rarr; server <code class="r ent">DaemonConnection</code> (drives eligibility + recovery)</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><b>Claim work</b></td>
+          <td><span class="dir">daemon &rarr; server &rarr; daemon</span></td>
+          <td><code class="r sur">RotationWork</code>: <code class="r trig">ClaimRotation</code> answered by <code class="r trig">RotationClaimed</code></td>
+          <td>server <code class="r ent">RotationJob</code> &rarr; daemon <code class="r ent">RotationAttempt</code> (target id/name, kind, policy, cipher, account, terminate flag)</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td><b>Write back</b></td>
+          <td><span class="dir">daemon &rarr; server</span></td>
+          <td><code class="r sur">CipherWriteback</code>: <code class="r trig">SubmitCipherUpdate</code> &rarr; <code class="r trig">Accept/RejectCipherUpdate</code></td>
+          <td>new ciphertext to <code class="r ent">Cipher</code>; the <b>claimed <code class="r ent">RotationJob</code> is the write capability</b> (no separate nonce)</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td><b>Report outcome</b></td>
+          <td><span class="dir">daemon &rarr; server</span></td>
+          <td><code class="r ent">RotationAttempt</code>.status transitions observed</td>
+          <td>drives <code class="r trig">MarkJobSucceeded</code> / <code class="r trig">RetryJob</code> / <code class="r trig">FailJob</code> server-side</td>
+        </tr>
+        <tr>
+          <td>6</td>
+          <td><b>Shared data shapes</b></td>
+          <td><span class="dir">server &rarr; daemon</span></td>
+          <td>snapshot on claim</td>
+          <td><code class="r ent">TargetSystem</code> (kind, policy) &rarr; <code class="r ent">RotationAttempt</code>; <code class="r">PasswordPolicy</code> &rarr; daemon copy; <code class="r ent">RotationConfig</code> <b>references</b> daemon-owned <code class="r ent">Cipher</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="shape">
+    <h2><span class="num">4</span>The shape it reveals</h2>
+
+    <div class="callout">
+      <div class="lbl">Ownership is one-directional</div>
+      The server owns <em>what &amp; when</em> (<code class="r ent">TargetSystem</code>, <code class="r">PasswordPolicy</code>,
+      <code class="r ent">RotationConfig</code>, <code class="r ent">RotationJob</code>, eligibility). The daemon owns
+      <em>how</em> (connection details resolved locally by id, integration execution, encryption). The daemon never
+      references a server type — it works entirely from the claim snapshot.
+    </div>
+
+    <div class="callout good">
+      <div class="lbl">The job-attempt pair is the spine</div>
+      A <code class="r ent">RotationJob</code> (server-side, durable, counts attempts, recovers) spawns a
+      <code class="r ent">RotationAttempt</code> (daemon-side, one try). They are correlated not by a back-reference
+      but through <code class="r">Cipher &rarr; RotationConfig &rarr;</code> the config&rsquo;s single claimed job —
+      which is why <code class="r">OneConfigPerCipher</code> and <code class="r">AtMostOneActiveJobPerConfig</code> matter.
+    </div>
+
+    <div class="callout warn">
+      <div class="lbl">The job doubles as the auth token</div>
+      Cipher writes are authorised against the claimed job&rsquo;s ownership (<code class="r">job.claimed_by</code>) plus
+      its in-flight status — so <b>dispatch and write-authorisation are the same concept</b>. That is exactly why a
+      dropped, released, or timed-out job auto-fences stale writes (<code class="r trig">RejectCipherUpdate</code>): there
+      is no longer a claimed job for this writer.
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  if (window.mermaid) {
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "dark",
+      themeVariables: {
+        background: "#0b0d12",
+        primaryColor: "#1c212b",
+        primaryBorderColor: "#3a4456",
+        primaryTextColor: "#e7ebf2",
+        lineColor: "#5b6678",
+        fontSize: "16px"
+      },
+      flowchart: { useMaxWidth: true, htmlLabels: true, curve: "basis" }
+    });
+  }
+</script>
+</body>
+</html>

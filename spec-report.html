@@ -318,11 +318,16 @@
     <!-- ===================== 2 BOUNDARY ===================== -->
     <section id="boundary">
       <h2><span class="num">2</span>The two sides and their boundary</h2>
-      <p>The system is modelled as two specs with a strict one-way dependency. The server spec
-      <code class="r">use</code>s the daemon spec (<code class="r">use "./rotation-daemon.allium" as daemon</code>),
-      so the server may reference daemon types by qualified name (<code class="r ent">daemon/Cipher</code>,
-      <code class="r ent">daemon/RotationAttempt</code>), but the daemon can never reference server types. That asymmetry
-      is deliberate: the daemon works only from a self-contained snapshot handed to it on each claim.</p>
+      <p>The daemon and the server are two separate applications that run in tandem but are cleanly separated by an
+      API. The daemon is a standalone app: it opens a connection to the server, authenticates, claims jobs and
+      reports outcomes back — all over that link (a SignalR/WebSocket transport, modelled as
+      <code class="r ent">ServerConnection</code> with a <code class="r ent">DaemonSession</code> riding on top). It never
+      reaches into the server's internals; everything a rotation needs arrives on the claim as a self-contained work
+      snapshot, so the daemon can act without calling back for more. That one-way flow is deliberate, and the two
+      Allium specs mirror it: the server spec <code class="r">use</code>s the daemon spec
+      (<code class="r">use "./rotation-daemon.allium" as daemon</code>) and references daemon types by qualified name
+      (<code class="r ent">daemon/Cipher</code>, <code class="r ent">daemon/RotationAttempt</code>), but never the
+      reverse.</p>
 
       <div class="grid2">
         <div class="card">
@@ -368,14 +373,15 @@ flowchart LR
   RA -- "SubmitCipherUpdate" --> RJ
   LC -. "host / user / pass" .-> RA
   DR -. eligibility .- RJ
-  SRV == "use (one-way layering)" ==> DMN
+  SRV -. "spec use (one-way layering)" .-> DMN
   classDef s fill:#172033,stroke:#2d3f5b,color:#cfe0ff;
   classDef d fill:#13241f,stroke:#1f5b52,color:#bdf0e6;
   class TS,RC,RJ,DR s;
   class CN,RA,LC d;
         </div>
-        <div class="cap">The boundary. The server hands a complete work snapshot down on the claim; the daemon resolves
-        the actual secrets locally and reports an outcome back up. The <code>use</code> edge points server → daemon only.</div>
+        <div class="cap">The boundary is an API between two separate apps. The daemon connects up to the server, claims a
+        job carrying a complete work snapshot, resolves the actual secrets locally, and reports the outcome back. The
+        <code>use</code> edge is spec-level only (server → daemon) and just mirrors that one-way flow.</div>
       </div>
     </section>
 
