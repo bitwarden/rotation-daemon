@@ -153,17 +153,27 @@ entity TargetSystem {
     }
 }
 
--- A registered rotation daemon identity. The admin registers a daemon, the server
--- issues its credential (an OAuth2 client_id + client_secret plus a local
--- encryption key, delivered out of band; only the client_id is retained here), and
--- the daemon authenticates with it (see rotation-daemon.allium / DaemonSession).
--- Revoking a registration invalidates the credential and the daemon's session.
+-- A registered rotation daemon identity. The admin registers a daemon and the server
+-- issues its credential the same way Secrets Manager issues a machine-account access
+-- token: a single string 0.<client_id>.<client_secret>:<encryption_key>. The server
+-- generates all three parts, wraps the organization key under the encryption_key, and
+-- KEEPS the wrapped blob (encrypted_organization_key) so it can hand it back on every
+-- authentication. What it does NOT keep is the encryption_key or the plaintext org key:
+-- the encryption_key lives only in the token string, shown once and delivered out of band
+-- to the daemon (zero-knowledge -- see rotation-daemon.allium / DaemonSession,
+-- AuthenticationSurface). Only the client_id (and a secret hash, for auth) and this wrapped
+-- blob are retained. Revoking a registration invalidates the credential and the session.
 -- Status literals are deliberately distinct from TargetSystem's (enrolled/revoked, not
 -- active/disabled) so untyped trigger-param inference stays unambiguous.
 entity DaemonRegistration {
     id: String
     name: String
     client_id: String
+    -- The organization key wrapped under the daemon's provisioned encryption_key (the
+    -- post-colon segment of its access token). Stored at registration and returned to the
+    -- daemon on each authentication, which unwraps it locally. The server never holds the
+    -- encryption_key, so it cannot itself unwrap this (zero-knowledge).
+    encrypted_organization_key: String
     status: enrolled | revoked
 
     transitions status {
@@ -350,17 +360,40 @@ entity RotationAttempt {
 -- cron-expression evaluation, which is an implementation concern.
 deferred NextScheduledTime    -- see: server-side cron evaluation
 
+-- Credential issuance: generate the daemon's symmetric encryption_key and wrap the
+-- organization key under it, yielding the blob stored on the registration and returned on
+-- each authentication. The encryption_key is emitted only inside the one-time access token
+-- (0.<client_id>.<client_secret>:<encryption_key>); it is never retained server-side, so
+-- the server cannot itself unwrap the result. Mirrors Secrets Manager's machine-account
+-- key delivery, applied to the organization key.
+deferred WrapOrganizationKeyForDaemon    -- see: zero-knowledge org-key wrapping at registration
+
 -- Daemon registration
 
 rule RegisterDaemon {
     when: RegisterDaemon(name, client_id)
     requires: not exists DaemonRegistration{client_id: client_id}
-    ensures: DaemonRegistration.created(name: name, client_id: client_id, status: enrolled)
+    let wrapped_org_key = WrapOrganizationKeyForDaemon(client_id)
+    ensures: DaemonRegistration.created(
+        name: name,
+        client_id: client_id,
+        encrypted_organization_key: wrapped_org_key,
+        status: enrolled
+    )
     @guidance
-        -- The server issues the daemon's access token (client_id + client_secret and
-        -- a local encryption key) out of band. The secret and encryption key are not
-        -- retained server-side in recoverable form; only the client_id is kept, for
-        -- identification (zero-knowledge, see rotation-daemon.allium).
+        -- Provisioning follows Secrets Manager's machine-account mechanic. The server
+        -- generates the credential as one access-token string,
+        -- 0.<client_id>.<client_secret>:<encryption_key>, wraps the organization key under
+        -- the encryption_key (WrapOrganizationKeyForDaemon), and stores the wrapped blob on
+        -- the registration (encrypted_organization_key) to hand back on every authentication.
+        -- It retains the client_id and a hash of the client_secret (for auth) plus that
+        -- wrapped blob -- NOT the encryption_key or the plaintext org key. The full token is
+        -- shown once and delivered out of band to the daemon, which keeps the encryption_key
+        -- locally and uses it to unwrap the org key (zero-knowledge; see rotation-daemon.allium
+        -- / HandleAuthenticationSucceeded). The org key is the same symmetric key SM machine
+        -- accounts receive, but the daemon's authorization to write vault ciphers is broader
+        -- than an SM account's -- the resulting crypto blast radius is the "Read blast radius"
+        -- open question, contained at the API layer (ApiScopedReads), not here.
 }
 
 rule InitDaemonConnection {

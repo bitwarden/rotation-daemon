@@ -98,20 +98,26 @@ entity ServerConnection {
 }
 
 -- Authentication
--- The daemon authenticates with the Bitwarden server using a provisioned access
--- token: an OAuth2 client-credentials grant (client_id + client_secret) that the
--- server exchanges for a short-lived bearer access token. The provisioned token
--- also carries a local encryption_key, never transmitted, which the daemon uses to
--- decrypt the organization key the server returns. The daemon needs that key to
--- encrypt password updates into organization vault ciphers, and the server never
--- holds the plaintext key or password (zero-knowledge). This borrows Secrets
--- Manager's token and zero-knowledge key-delivery pattern, but vault-cipher access
--- is a broader authorization than an SM machine account has -- see the open
--- question on the vault key grant.
+-- The daemon authenticates with a provisioned access token exactly as a Secrets Manager
+-- machine account does: one string of the form 0.<client_id>.<client_secret>:<encryption_key>.
+-- The half before the colon is an OAuth2 client-credentials grant (client_id + client_secret)
+-- the server exchanges for a short-lived bearer access token; the segment AFTER the colon is
+-- a symmetric encryption_key that never leaves the daemon. At registration the server wrapped
+-- the organization key under that encryption_key and stored only the wrapped blob
+-- (rotation-server.allium / DaemonRegistration.encrypted_organization_key); on each
+-- authentication it returns that blob, and the daemon unwraps it locally with encryption_key
+-- to recover the org key. The daemon needs the org key to encrypt password updates into
+-- organization vault ciphers; the server never holds the encryption_key, the plaintext org
+-- key, or any plaintext password (zero-knowledge). This is SM's exact token + key-delivery
+-- mechanic; the only difference is that the daemon's authorization to write vault ciphers is
+-- broader than an SM machine account's -- the residual crypto blast radius is the "Read blast
+-- radius" open question, contained at the API layer (rotation-server.allium / ApiScopedReads).
 
 external entity DaemonCredential {
     client_id: String
     client_secret: String
+    -- The post-colon segment of the access token: a symmetric key that unwraps the org key
+    -- returned on authentication. Lives only on the daemon; never transmitted to the server.
     encryption_key: String
 }
 
@@ -119,6 +125,12 @@ external entity DaemonCredential {
 given {
     credential: DaemonCredential
 }
+
+-- Unwrap the organization key the server returns on authentication (the wrapped blob
+-- rotation-server.allium / DaemonRegistration.encrypted_organization_key) using the daemon's
+-- own encryption_key. Local, daemon-only crypto: the encryption_key never leaves the daemon,
+-- so the server cannot perform this itself (zero-knowledge).
+deferred UnwrapOrganizationKey    -- see: daemon-local org-key unwrap with credential.encryption_key
 
 -- The authenticated session that rides on a ServerConnection: it holds the short-lived
 -- access token and the decrypted organization key, and tracks the credential lifecycle
@@ -187,7 +199,7 @@ surface AuthenticationSurface {
     context session: DaemonSession
 
     provides:
-        AuthenticationSucceeded(session, access_token, expires_at, organization_key)
+        AuthenticationSucceeded(session, access_token, expires_at, encrypted_organization_key)
             when session.status = authenticating
         AuthenticationRejected(session)
             when session.status = authenticating
@@ -195,10 +207,11 @@ surface AuthenticationSurface {
             when session.status = active
 
     @guarantee ServerZeroKnowledge
-        -- The organization key crosses the server boundary only in encrypted form;
-        -- the daemon decrypts it locally with credential.encryption_key, which is
-        -- never transmitted. The server never holds the plaintext organization key,
-        -- nor any plaintext password the daemon later writes to a cipher.
+        -- The organization key crosses the server boundary only in wrapped form: the server
+        -- returns encrypted_organization_key (the blob it stored at registration), and the
+        -- daemon unwraps it locally with credential.encryption_key, which is never transmitted.
+        -- The server holds neither the encryption_key nor the plaintext organization key, and
+        -- never any plaintext password the daemon later writes to a cipher.
 }
 
 surface IntegrationSurface {
@@ -241,20 +254,22 @@ rule DaemonConnects {
 }
 
 rule HandleAuthenticationSucceeded {
-    when: AuthenticationSucceeded(session, access_token, expires_at, organization_key)
+    when: AuthenticationSucceeded(session, access_token, expires_at, encrypted_organization_key)
     requires: session.status = authenticating
     requires: session.connection.status = connecting
+    let organization_key = UnwrapOrganizationKey(encrypted_organization_key, session.credential.encryption_key)
     ensures: session.status = active
     ensures: session.access_token = access_token
     ensures: session.expires_at = expires_at
     ensures: session.organization_key = organization_key
     ensures: ConnectionAuthenticated(connection: session.connection)
     @guidance
-        -- The server returns a short-lived access token and the organization key in
-        -- encrypted form. organization_key here is the daemon-local result of
-        -- decrypting that payload with credential.encryption_key (see the
-        -- AuthenticationSurface ServerZeroKnowledge guarantee). The connection is
-        -- signalled ready only once authentication succeeds (see OpenConnection).
+        -- The server returns a short-lived access token and the wrapped organization key
+        -- (encrypted_organization_key -- the blob it stored at registration). The daemon
+        -- unwraps it locally with its credential.encryption_key (UnwrapOrganizationKey) to
+        -- get the plaintext org key it holds for the session; the key never crosses the
+        -- boundary in the clear (ServerZeroKnowledge). The connection is signalled ready only
+        -- once authentication succeeds (see OpenConnection).
 }
 
 rule HandleAuthenticationRejected {
