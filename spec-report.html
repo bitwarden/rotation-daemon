@@ -813,7 +813,7 @@ sequenceDiagram
   Note over S: job to claimed, claimed_by = D<br/>server creates RotationAttempt (executing), audit: dispatched
   S-->>D: RotationClaimed (attempt_id, id, name, kind, policy, cipher, account, ...)
   Note over D: StartRotation then ExecuteRotation<br/>(executes from snapshot, no local attempt entity)
-  D->>D: resolve connection details via CredentialResolver(target_system_id)<br/>(env-first; SM / local config opt-in)
+  D->>D: resolve connection details via CredentialResolver(target_system_id)<br/>(env-first, SM / local config opt-in)
   D->>D: generate password per policy
   D->>T: run kind integration, set new password
   D->>V: GET cipher (only this one, no broader read scope)
