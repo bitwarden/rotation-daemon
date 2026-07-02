@@ -1006,6 +1006,20 @@ flowchart TD
         The resolver encapsulates the lookup; the precedence policy is not yet pinned down.</div></details>
 
       <h4>Server spec</h4>
+      <details class="oq"><summary>account_identity integrity (server-tamper resistance) <span class="oqtag">deferred</span></summary>
+        <div class="oqbody"><code class="r">account_identity</code> is stored server-side in plaintext on <code class="r ent">RotationConfig</code> and carried verbatim to the daemon on the
+        claim (<code class="r trig">RotationClaimed</code>), where it picks which target-system account is rotated and session-terminated. A compromised or malicious server could
+        substitute a different <code class="r">account_identity</code>, pointing the daemon's privileged operations at an account the admin never chose. Encrypting/authenticating it
+        client-side under the org key when the admin saves the config (exactly as vault ciphers are, so the server stores ciphertext it can neither read nor forge) would let the daemon
+        detect substitution on the claim — extending <code class="r">ServerZeroKnowledge</code> from the password to the account identity, closed at the crypto layer like the
+        Read-blast-radius question.</div></details>
+      <details class="oq"><summary>Lease-bound least-privilege daemon auth <span class="oqtag">deferred</span></summary>
+        <div class="oqbody">The daemon's client-credentials session (<code class="r ent">DaemonSession</code>) carries broad standing authority to write vault ciphers; operations are scoped only
+        after the fact by the claimed <code class="r ent">RotationJob</code> (<code class="r">JobBoundWrite</code>) and <code class="r">ApiScopedReads</code>. Hardening: carry a lease-id on the
+        job (from the upstream grant — a PAM lease, see <code class="r trig">RotateOnAccessEnd</code>) and have the server grant only the strictly-needed endpoints when the daemon presents a
+        lease-id that is due for rotation <i>and</i> matches the target cipher — turning standing authority into a per-lease capability, so a stolen credential with no live, due lease
+        grants nothing (defence in depth beyond <code class="r">JobBoundWrite</code>/<code class="r">ApiScopedReads</code>). Open whether it generalises to scheduled/on-demand jobs
+        (no upstream lease) or applies only to access-end jobs.</div></details>
       <details class="oq"><summary>Failure handling (§6.8)</summary>
         <div class="oqbody"><code class="r trig">FailJob</code> and <code class="r trig">JobTimesOut</code> currently reschedule to a near-term retry and
         emit <code class="r trig">RotationFailed</code> as the seam. §6.8 should define the real policy — alerting and auto-disable after a
