@@ -290,8 +290,8 @@
         Server account, or anything reachable by a custom script — and then writing the new password back into the
         matching vault <code class="r ent">Cipher</code>.
       </p>
-      <p>End to end, a single rotation walks through seven steps — the server sets the work up and dispatches it,
-      the daemon carries it out against the live system, and the server records the result:</p>
+      <p>End to end, a single rotation walks through eight steps — the server sets the work up and dispatches it,
+      the daemon carries it out against the live system and proves it worked, and the server records the result:</p>
       <div class="diagram">
         <div class="mermaid">
 flowchart TD
@@ -299,17 +299,18 @@ flowchart TD
   B["② Rotation comes due — the server offers<br/>a job (nothing is pushed at a daemon)"]
   C["③ An eligible daemon claims the job; the server<br/>creates the attempt and hands over a work snapshot"]
   D["④ Daemon resolves the target's credentials locally,<br/>generates a new password, rotates it in the live system"]
-  E["⑤ Daemon writes the new password back to the vault —<br/>encrypted, so the server only ever stores ciphertext"]
-  F["⑥ Daemon reports the outcome back, by attempt_id"]
-  G["⑦ Server records the result and audit trail,<br/>then schedules the next rotation"]
-  A --> B --> C --> D --> E --> F --> G
+  V["⑤ Daemon verifies the rotation — the account must<br/>authenticate with the new password before success"]
+  E["⑥ Daemon writes the new password back to the vault —<br/>encrypted, so the server only ever stores ciphertext"]
+  F["⑦ Daemon reports the outcome back, by attempt_id"]
+  G["⑧ Server records the result and audit trail,<br/>then schedules the next rotation"]
+  A --> B --> C --> D --> V --> E --> F --> G
   G -.->|"on failure with retries left, the job is offered again (a retry is just a fresh claim)"| B
   classDef s fill:#172033,stroke:#2d3f5b,color:#cfe0ff;
   classDef d fill:#13241f,stroke:#1f5b52,color:#bdf0e6;
   class A,B,C,G s;
-  class D,E,F d;
+  class D,V,E,F d;
         </div>
-        <div class="cap">The whole loop at a glance — <b style="color:#cfe0ff">server steps</b> in blue, <b style="color:#bdf0e6">daemon steps</b> in green: the work crosses the API to the daemon at ③ and the outcome crosses back at ⑥. The detail follows — the entities in §3, the state machines in §4, the step-by-step flows in §5.</div>
+        <div class="cap">The whole loop at a glance — <b style="color:#cfe0ff">server steps</b> in blue, <b style="color:#bdf0e6">daemon steps</b> in green: the work crosses the API to the daemon at ③ and the outcome crosses back at ⑦. The detail follows — the entities in §3, the state machines in §4, the step-by-step flows in §5.</div>
       </div>
       <div class="grid3">
         <div class="card">
@@ -359,7 +360,7 @@ flowchart TD
             <li>Rotation configuration &amp; triggers (<code class="r ent">RotationConfig</code>, with an inline <code class="r">Schedule?</code> + <code class="r">rotate_on_access_end</code>).</li>
             <li>Scheduling, dispatch, job tracking, retry orchestration, timeout, recovery (<code class="r ent">RotationJob</code>).</li>
             <li>Rotation attempts (<code class="r ent">RotationAttempt</code>) — created on claim; their lifecycle and outcome, recorded from the daemon's report.</li>
-            <li>Cipher-write authorisation and audit emission.</li>
+            <li>Cipher-write authorisation and audit emission — every operation, rotation and administrative alike (<code class="r trig">RotationAudited</code> + <code class="r trig">AdministrationAudited</code>).</li>
           </ul>
         </div>
         <div class="card">
@@ -368,7 +369,7 @@ flowchart TD
             <li>The transport link (<code class="r ent">ServerConnection</code>) and authenticated session (<code class="r ent">DaemonSession</code>).</li>
             <li>Executing one try from the claim's work snapshot for the kind carried on the claim. It holds <b>no attempt entity</b> — the attempt is server-owned; it works only from the snapshot and reports the outcome by <code class="r">attempt_id</code>.</li>
             <li>Resolving connection details via the env-first <code class="r">CredentialResolver</code>, keyed by <code class="r">target_system_id</code> (Secrets Manager and local config are pluggable, opt-in resolvers).</li>
-            <li>Generating a policy-compliant password and writing back the encrypted cipher.</li>
+            <li>Generating a policy-compliant password, verifying the rotated credential against the target system, and writing back the encrypted cipher.</li>
             <li>Best-effort session termination as a sub-step of the attempt (its own local retry budget) and local transient retry.</li>
           </ul>
         </div>
@@ -491,6 +492,7 @@ flowchart LR
             <div class="f"><div class="k">claimed_by</div><div class="v"><code class="r ent">DaemonRegistration</code> — the daemon executing this attempt (only it may report).</div></div>
             <div class="f"><div class="k">status</div><div class="v"><span class="state mid">executing</span> / <span class="state go term">rotated</span> / <span class="state bad term">errored</span> / <span class="state term">abandoned</span>. Literals are deliberately disjoint from <code class="r ent">RotationJob</code>'s.</div></div>
             <div class="f"><div class="k">failure_reason</div><div class="v"><code class="r">String?</code> — present only when <span class="state bad">errored</span>.</div></div>
+            <div class="f"><div class="k">sync_state</div><div class="v"><code class="r">FailureSyncState</code> — present only when <span class="state bad">errored</span>; where the failure left the vault relative to the target: <span class="state">target_unchanged</span> (the target was not modified; the stored cipher still matches it), <span class="state mid">target_updated</span> (the target was changed but the cipher was not — the stored credential is stale until a later attempt converges), or <span class="state">indeterminate</span> (the daemon cannot tell whether the change applied, e.g. a timeout after submission). An <span class="state">abandoned</span> attempt reports nothing, so its sync state is unknown by construction.</div></div>
             <div class="f"><div class="k">session_termination</div><div class="v"><code class="r">SessionTerminationOutcome</code> — present only when <span class="state go">rotated</span>; the best-effort outcome the daemon reported with success.</div></div>
           </div>
           <div class="desc" style="margin-top:12px"><b>States:</b> <span class="state go">rotated</span>/<span class="state bad">errored</span> (not succeeded/failed); only <span class="state bad">errored</span> spends the retry budget.
@@ -502,7 +504,7 @@ flowchart LR
         <div class="entity">
           <div class="head"><span class="name">DaemonRegistration</span><span class="tag owner-srv">server</span></div>
           <div class="body">
-            <div class="desc">A registered daemon identity. Server issues the credential out of band; only <code class="r">client_id</code> is retained.</div>
+            <div class="desc">A registered daemon identity. Server issues the credential out of band as one token string; it retains the <code class="r">client_id</code> (plus a secret hash) and the org key wrapped under the daemon's <code class="r">encryption_key</code> — never the key itself.</div>
             <div class="fields">
               <div class="f"><div class="k">name / client_id</div><div class="v">Identity.</div></div>
               <div class="f"><div class="k">status</div><div class="v"><span class="state go">enrolled</span> / <span class="state bad term">revoked</span>.</div></div>
@@ -551,7 +553,10 @@ flowchart LR
         <p style="margin:6px 0 0">The daemon holds <b>no <code class="r ent">RotationAttempt</code></b> and <b>no session-termination entity</b> of its own — both are
         server-side now (the attempt is the server's <code class="r ent">RotationAttempt</code>; session termination is folded into it). The daemon works entirely from the
         self-contained <code class="r trig">RotationClaimed</code> work snapshot (<code class="r">attempt_id</code>, target details, password policy, cipher,
-        account identity, terminate flag) and reports the outcome back by <code class="r">attempt_id</code>.</p>
+        account identity, terminate flag) and reports the outcome back by <code class="r">attempt_id</code> — a success via
+        <code class="r trig">RotationSucceeded(attempt_id, session_termination)</code>, a failure via
+        <code class="r trig">RotationAttemptFailed(attempt_id, reason, sync_state)</code>, relayed to the server as
+        <code class="r trig">ReportRotationFailed(reporter, attempt_id, failure_reason, sync_state)</code>.</p>
       </div>
 
       <div class="grid2">
@@ -781,13 +786,13 @@ flowchart TD
   T1 --> OF["OfferRotation<br/>(enabled, automatic, active, no active job)"]
   T2 --> OF
   T3 --> OF
-  OF --> JOB["RotationJob created: pending<br/>server push-notifies eligible daemons"]
+  OF --> JOB["RotationJob created: pending, audit: offered<br/>server push-notifies eligible daemons"]
   JOB --> CL["ClaimRotation<br/>(connected, assigned, token re-validated)<br/>then claimed; server creates RotationAttempt: executing"]
   CL --> RClaimed["RotationClaimed (work snapshot, attempt_id) + audit: dispatched"]
   RClaimed --> SR["StartRotation then ExecuteRotation<br/>(daemon executes from the snapshot, no local attempt entity)"]
   SR --> OUT{outcome reported by attempt_id}
   OUT -->|ReportRotationSucceeded| ROT["RecordRotationSucceeded<br/>attempt: executing then rotated"]
-  OUT -->|ReportRotationFailed| ERR["RecordRotationFailed<br/>attempt: executing then errored"]
+  OUT -->|ReportRotationFailed| ERR["RecordRotationFailed<br/>attempt: executing then errored (reason + sync_state)"]
   ROT --> OK["MarkJobSucceeded<br/>job succeeded, reschedule, audit: succeeded"]
   ERR --> FAIL{has_retry_budget?}
   FAIL -->|yes| RJ["RetryJob then pending (backoff), audit: attempt_failed"]
@@ -816,6 +821,7 @@ sequenceDiagram
   D->>D: resolve connection details via CredentialResolver(target_system_id)<br/>(env-first, SM / local config opt-in)
   D->>D: generate password per policy
   D->>T: run kind integration, set new password
+  D->>T: verify the rotation — confirm the account authenticates<br/>with the new password (no success until this passes)
   D->>V: GET cipher (only this one, no broader read scope)
   D->>S: SubmitCipherUpdate(writer=D, attempt by attempt_id, new_password)
   alt server-local attempt executing + job claimed by this daemon
@@ -827,7 +833,8 @@ sequenceDiagram
   end
         </div>
         <div class="cap">No separate write token. The daemon's own claimed job (<code class="r">claimed_by</code> + <code class="r">claimed</code> status) is the capability;
-        the write targets the attempt's cipher only, and the server stores ciphertext without decrypting it.</div>
+        the write targets the attempt's cipher only, and the server stores ciphertext without decrypting it. The write happens only after the rotated
+        credential is verified against the target — success is reported only once both have passed (guarantee <code class="r sur">VerifiedBeforeSuccess</code>).</div>
       </div>
 
       <h3>(c) Recovery paths — retry, daemon-drop release, timeout</h3>
@@ -847,7 +854,9 @@ flowchart TD
         </div>
         <div class="cap">Only an <span class="state bad">errored</span> attempt spends a retry-budget unit (<code class="r">failed_attempts</code> counts <code class="r">status = errored</code> only).
         A connectivity drop (<code class="r trig">ReleaseJob</code>) or a mid-attempt timeout (<code class="r trig">JobTimesOut</code>) marks the in-flight attempt
-        <span class="state">abandoned</span> via <code class="r trig">AbandonAttempt</code>, which is never charged. <code class="r trig">JobTimesOut</code> backstops anything that never resolves.</div>
+        <span class="state">abandoned</span> via <code class="r trig">AbandonAttempt</code>, which is never charged. <code class="r trig">JobTimesOut</code> backstops anything that never resolves.
+        A genuine failure's report also carries the vault↔target <code class="r">sync_state</code> it left behind, recorded on the errored attempt;
+        an abandoned attempt reports nothing, so its sync state is unknown by construction.</div>
       </div>
 
       <h3>(d) Connection + authentication lifecycle</h3>
@@ -931,22 +940,70 @@ flowchart TD
         boundary; many daemons can be assigned one target for HA, and first claim wins.</p>
       </div>
 
-      <h3>Audit emission</h3>
-      <p>Every rotation attempt and outcome emits <code class="r trig">RotationAudited</code> — a pure sink (no rule chains off it).
-      Durable WORM storage is the existing Phase-1 audit log's job, out of scope here. Outcomes:</p>
+      <h3>Audit emission — every operation</h3>
+      <p><b>Every operation the server performs is written to the audit log</b> — viewing the audit log is how an operator can
+      tell a credential was rotated. Two pure-sink events carry it (no rule chains off either); durable WORM storage is the
+      existing Phase-1 audit log's job, out of scope here. <code class="r trig">RotationAudited</code> covers every configuration
+      and rotation event:</p>
       <table>
         <thead><tr><th>Outcome</th><th>Emitted by</th><th>Meaning</th></tr></thead>
         <tbody>
+          <tr><td><code class="r">config_created</code></td><td>AuditRotationConfigCreated</td><td>A rotation configuration was created (a reaction rule on <code class="r">RotationConfig.created</code>).</td></tr>
+          <tr><td><code class="r">settings_updated</code></td><td>UpdateRotationSettings</td><td>The credential's triggers/schedule were edited (carries <code class="r">actor</code>).</td></tr>
+          <tr><td><code class="r">paused</code></td><td>PauseRotation</td><td>Rotation paused without losing configuration (carries <code class="r">actor</code>).</td></tr>
+          <tr><td><code class="r">resumed</code></td><td>ResumeRotation</td><td>Rotation resumed, next occurrence recomputed (carries <code class="r">actor</code>).</td></tr>
+          <tr><td><code class="r">offered</code></td><td>OfferRotation</td><td>A due rotation became an available job (carries <code class="r">source</code>).</td></tr>
           <tr><td><code class="r">dispatched</code></td><td>ClaimRotation</td><td>A daemon claimed the job (the attempt begins).</td></tr>
           <tr><td><code class="r">succeeded</code></td><td>MarkJobSucceeded</td><td>The attempt succeeded.</td></tr>
-          <tr><td><code class="r">attempt_failed</code></td><td>RetryJob</td><td>An attempt failed but will be retried (carries <code class="r">reason</code>).</td></tr>
-          <tr><td><code class="r">failed</code></td><td>FailJob</td><td>All attempts failed (carries <code class="r">reason</code>).</td></tr>
+          <tr><td><code class="r">attempt_failed</code></td><td>RetryJob</td><td>An attempt failed but will be retried (carries <code class="r">reason</code> and <code class="r">sync_state</code>).</td></tr>
+          <tr><td><code class="r">failed</code></td><td>FailJob</td><td>All attempts failed (carries <code class="r">reason</code> and <code class="r">sync_state</code>).</td></tr>
           <tr><td><code class="r">released</code></td><td>ReleaseJob</td><td>A claim was released after a daemon drop.</td></tr>
           <tr><td><code class="r">timed_out</code></td><td>JobTimesOut</td><td>Unresolved past the deadline (server-side reason).</td></tr>
           <tr><td><code class="r">write_rejected</code></td><td>RejectCipherUpdate</td><td>A cipher write was refused.</td></tr>
           <tr><td><code class="r">manual_recorded</code></td><td>RecordManualRotation</td><td>An admin recorded an out-of-band rotation (carries <code class="r">actor</code>).</td></tr>
         </tbody>
       </table>
+      <p><code class="r">source</code> (why the rotation fired) rides on every job-derived outcome; <code class="r">sync_state</code>
+      (<code class="r">FailureSyncState</code>) rides on <code class="r">attempt_failed</code> and <code class="r">failed</code> so the log records whether
+      a failure left the stored cipher stale; <code class="r">actor</code> is the acting admin on <code class="r">manual_recorded</code>,
+      <code class="r">settings_updated</code>, <code class="r">paused</code> and <code class="r">resumed</code>. Each is absent where it does not apply.</p>
+      <p>The new pure-sink <code class="r trig">AdministrationAudited</code> covers every administrative operation on the fleet and targets:</p>
+      <table>
+        <thead><tr><th>Operation</th><th>Emitted by</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code class="r">daemon_registered</code></td><td>RegisterDaemon</td><td>A daemon was registered (name + client_id; credential issued out of band).</td></tr>
+          <tr><td><code class="r">daemon_revoked</code></td><td>RevokeDaemon</td><td>A daemon's credential was revoked.</td></tr>
+          <tr><td><code class="r">daemon_assigned</code></td><td>AssignDaemonToTarget</td><td>A daemon was granted eligibility for a target.</td></tr>
+          <tr><td><code class="r">daemon_unassigned</code></td><td>UnassignDaemonFromTarget</td><td>An assignment was removed.</td></tr>
+          <tr><td><code class="r">target_registered</code></td><td>Register(Automatic|Manual)TargetSystem</td><td>A target system was registered.</td></tr>
+          <tr><td><code class="r">target_disabled</code></td><td>DisableTargetSystem</td><td>A target was disabled (new rotations stop being offered).</td></tr>
+          <tr><td><code class="r">target_enabled</code></td><td>EnableTargetSystem</td><td>A target was re-enabled.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <span class="lbl">Not audited: connectivity edges</span>
+        <p style="margin:6px 0 0">Daemon connect/disconnect edges (<code class="r trig">DaemonConnected</code> /
+        <code class="r trig">DaemonDisconnected</code>) are liveness <i>observations</i>, not operations, and are not audited directly —
+        a drop's impact on in-flight work is audited via the <code class="r">released</code> outcome.</p>
+      </div>
+
+      <h3>Verification and the failure sync-state</h3>
+      <p>Step 4 of <code class="r trig">ExecuteRotation</code> <b>verifies the rotation</b>: the daemon confirms via the kind
+      integration that the account now authenticates with the new password (e.g. an authentication probe — the per-kind mechanics
+      are an open question). The rotation is not treated as succeeded until verification passes. Guarantee
+      <code class="r sur">VerifiedBeforeSuccess</code>: a rotation is reported succeeded only after the new credential has been
+      verified against the target system <i>and</i> the cipher write has been accepted — an unverified change is never reported
+      as success.</p>
+      <p>A failure that survives the daemon's local retries carries the vault↔target <code class="r">sync_state</code> it left behind
+      (<code class="r">FailureSyncState</code>, recorded on the errored attempt and audited):</p>
+      <ul>
+        <li><span class="state">target_unchanged</span> — the target was not modified; the stored cipher still matches it (a failure in steps 1–3 with the update known not to have applied).</li>
+        <li><span class="state mid">target_updated</span> — the target was changed but the cipher was not updated: the stored credential is <b>stale</b> until a later attempt or rotation converges (a failure after the target changed — verification, step 4, or the cipher write, step 5).</li>
+        <li><span class="state">indeterminate</span> — the daemon cannot tell whether the change applied (e.g. a timeout after submission).</li>
+      </ul>
+      <p class="muted">Each attempt is independent and starts fresh: a new password is generated and both the target and the cipher
+      are updated together, so a previous attempt's partial failure is converged by the next success — <code class="r">sync_state</code>
+      records the interim divergence.</p>
 
       <h3>Session termination — folded into the attempt</h3>
       <p>Session termination is no longer a separate entity. It is a guidance-level <b>sub-step of executing the rotation</b>
@@ -958,7 +1015,7 @@ flowchart TD
         <li>It <b>never fails or re-runs the rotation</b> (guarantee <code class="r sur">TerminationNeverFailsRotation</code>).</li>
         <li>"Requested but unsupported" is impossible: <code class="r trig">CreateRotationConfig</code> validates <code class="r">terminate_sessions</code> against the target's <code class="r">supports_session_termination</code> at config time, so the capability flag is no longer even sent to the daemon.</li>
       </ul>
-      <p class="muted">The rotation succeeds the moment the password is rotated and the cipher synced — termination is never on that critical path.</p>
+      <p class="muted">The rotation succeeds the moment the password is rotated, verified and the cipher synced (guarantee <code class="r sur">TerminationNeverFailsRotation</code>) — termination is never on that critical path.</p>
 
       <h3>Two distinct retry layers</h3>
       <div class="grid2">
@@ -967,7 +1024,8 @@ flowchart TD
           <p class="muted">Inside one try, transient faults (a network blip, a momentary target/API error) are retried
           <b>in place</b> up to <code class="r">max_retry_attempts</code> (5) with a <code class="r">retry_base_delay</code> backoff,
           inside <code class="r trig">ExecuteRotation</code>. The best-effort session-termination sub-step uses the same local budget on its own loop.
-          <code class="r trig">RotationAttemptFailed</code> is emitted only once these are exhausted (or the error is plainly non-transient).</p>
+          <code class="r trig">RotationAttemptFailed</code> is emitted only once these are exhausted (or the error is plainly non-transient),
+          carrying the vault↔target <code class="r">sync_state</code> the failure left behind.</p>
         </div>
         <div class="card">
           <h4>Server: attempt-level re-claim</h4>
@@ -1000,6 +1058,15 @@ flowchart TD
       <details class="oq"><summary>Custom-script result format</summary>
         <div class="oqbody">How does a <code class="r">custom_script</code> integration report its result — exit code, stdout parsing, or
         structured output? The spec leans toward exit code as simplest and most portable.</div></details>
+      <details class="oq"><summary>Verification mechanics per kind</summary>
+        <div class="oqbody">Step 4 of <code class="r trig">ExecuteRotation</code> verifies the rotated credential before the rotation is reported
+        succeeded. MSSQL can probe by opening a connection as the rotated login; Entra may not permit a plain password probe (MFA / conditional
+        access can block it) and may need a directory-level confirmation instead; a custom script needs a verify operation in its contract.
+        What does verification concretely mean for each kind — and may a kind opt out?</div></details>
+      <details class="oq"><summary>Mid-rotation disconnect</summary>
+        <div class="oqbody">When the daemon's connection drops mid-execution, its claim may be released server-side and re-claimed by another
+        daemon while this one is still acting on the target system (the cipher API is fenced; the target system is not). Should the daemon
+        abort in-flight execution on a connection drop? (See the claim-release race question, server side.)</div></details>
       <details class="oq"><summary>Credential resolver precedence</summary>
         <div class="oqbody">The default <code class="r">CredentialResolver</code> is environment variables, with Bitwarden Secrets Manager and a local config
         file as pluggable, opt-in resolvers. When more than one is configured, what is the precedence — and is it per-target or daemon-wide?
@@ -1050,8 +1117,28 @@ flowchart TD
         <div class="oqbody">Which upstream systems wire into <code class="r trig">AccessGrantEnded</code> (PAM leases, AAP grants, …)? The signal shape is
         resolved (it carries only the cipher); the concrete set of emitters and how they register is still open.</div></details>
       <details class="oq"><summary>On-demand actor attribution</summary>
-        <div class="oqbody">On-demand and access-triggered jobs record a <code class="r">source</code> but not the triggering admin (only
-        <code class="r">manual_recorded</code> carries an <code class="r">actor</code>). Should the audit attribute the on-demand actor end to end?</div></details>
+        <div class="oqbody">On-demand and access-triggered jobs record a <code class="r">source</code> but not the triggering admin
+        (<code class="r">settings_updated</code>, <code class="r">paused</code>, <code class="r">resumed</code> and <code class="r">manual_recorded</code>
+        carry an <code class="r">actor</code>; the job-derived outcomes do not). Should the audit attribute the on-demand actor end to end?</div></details>
+      <details class="oq"><summary>Cipher-level "last rotated" display</summary>
+        <div class="oqbody">Should the vault UI show a last-rotated timestamp on the cipher itself, derived by querying the audit log for
+        rotation events (the audit log being the authoritative record that a rotation happened), rather than a field the rotation machinery
+        maintains? <code class="r">RotationConfig.last_rotation_at</code> exists server-side; this question is about surfacing rotation history
+        on the cipher.</div></details>
+      <details class="oq"><summary>Disabled-target catch-up and dropped triggers</summary>
+        <div class="oqbody"><code class="r trig">EnableTargetSystem</code> does not recompute its configurations' <code class="r">next_rotation_at</code>
+        (unlike <code class="r trig">ResumeRotation</code>'s recompute-on-resume), so a schedule that came due while the target was disabled may stay
+        dormant after re-enable. And an on-demand <code class="r trig">TriggerRotation</code> or <code class="r trig">AccessGrantEnded</code> arriving while
+        the target is disabled is silently dropped (<code class="r trig">OfferRotation</code>'s guard fails — no job, no audit, no standing obligation),
+        which for <code class="r">access_end</code> loses a security-relevant rotation. Decide the catch-up semantics on enable and whether dropped
+        triggers should be audited or queued.</div></details>
+      <details class="oq"><summary>Claim-release race at the target system</summary>
+        <div class="oqbody"><code class="r trig">ReleaseJob</code> makes a dropped daemon's job claimable again after <code class="r">retry_base_delay</code>,
+        but a network-partitioned daemon may still be mid-rotation against the target when another daemon re-claims; the cipher write is fenced
+        (<code class="r sur">JobBoundWrite</code>) but the target system is not, so the two can interleave target-side updates and leave the vault and
+        target out of sync until a later rotation converges (an abandoned attempt reports no <code class="r">sync_state</code> by construction).
+        Candidate mitigations: the daemon aborts in-flight execution when its connection drops (see the mid-rotation disconnect question, daemon
+        side), and/or a dedicated release backoff sized to a worst-case rotation duration instead of <code class="r">retry_base_delay</code>.</div></details>
       <details class="oq"><summary>Method switching</summary>
         <div class="oqbody">Can an admin move a target between automatic and manual after creation (and supply/clear kind, policy, termination capability),
         and what happens to its configs' schedules and any active jobs? <code class="r">ManualConfigNeverJobbed</code> assumes method is fixed at creation.</div></details>
@@ -1096,11 +1183,12 @@ flowchart TD
           <button class="reveal">Reveal answer</button>
           <div class="answer">
             <div class="verdict">The job becomes claimable again for a fresh, independent attempt.</div>
-            <p>The daemon reports the failure by <code class="r">attempt_id</code> (<code class="r trig">ReportRotationFailed</code>); the server
-            transitions its own <code class="r ent">RotationAttempt</code> to <span class="state bad">errored</span> (<code class="r trig">RecordRotationFailed</code>).
-            The attempt's transition drives the job: since <code class="r">has_retry_budget</code> still holds (<code class="r">failed_attempts.count &lt; max_attempts</code>),
+            <p>The daemon reports the failure by <code class="r">attempt_id</code> (<code class="r trig">ReportRotationFailed</code>, carrying the reason and the
+            vault↔target <code class="r">sync_state</code> it left behind); the server
+            transitions its own <code class="r ent">RotationAttempt</code> to <span class="state bad">errored</span> (<code class="r trig">RecordRotationFailed</code>),
+            recording both. The attempt's transition drives the job: since <code class="r">has_retry_budget</code> still holds (<code class="r">failed_attempts.count &lt; max_attempts</code>),
             <code class="r trig">RetryJob</code> fires: job → <span class="state mid">pending</span>, <code class="r">claimed_by</code> cleared,
-            <code class="r">next_claimable_at</code> pushed out by a backoff, audit <code class="r">attempt_failed</code> (with the reason). The next
+            <code class="r">next_claimable_at</code> pushed out by a backoff, audit <code class="r">attempt_failed</code> (with the reason and <code class="r">sync_state</code>). The next
             eligible daemon to claim makes a <b>brand-new</b> attempt (a new server-owned <code class="r ent">RotationAttempt</code>) starting from a freshly
             generated password — it could be the same daemon or another assigned one (free fail-over).</p>
             <div class="rules"><b>Rules:</b> ReportRotationFailed (daemon) · RecordRotationFailed → attempt errored · RetryJob (server) · ClaimRotation (re-claim)</div>
@@ -1119,7 +1207,9 @@ flowchart TD
             holds (<code class="r">failed_attempts.count &gt;= max_attempts</code>), so <code class="r trig">FailJob</code> fires instead of <code class="r trig">RetryJob</code>: job →
             <span class="state bad term">failed</span> (terminal), <code class="r">next_rotation_at</code> set to
             <code class="r">now + failure_retry_delay</code> (1 hour), audit <code class="r">failed</code>, and <code class="r trig">RotationFailed</code> is
-            emitted as the seam for the not-yet-specified §6.8 failure-handling policy (alerting / auto-disable). Only <span class="state bad">errored</span>
+            emitted as the seam for the not-yet-specified §6.8 failure-handling policy (alerting / auto-disable). The last attempt's
+            <code class="r">sync_state</code> rides on both emissions — a job that terminally fails <span class="state mid">target_updated</span> has left the stored
+            cipher stale, and the audit log carries that fact. Only <span class="state bad">errored</span>
             attempts count toward this budget — any <span class="state">abandoned</span> ones along the way are not. The near-term reschedule keeps the credential live until §6.8 lands.</p>
             <div class="rules"><b>Rules:</b> RecordRotationFailed → attempt errored · FailJob · RotationFailed (seam) · open question §6.8</div>
           </div>
@@ -1168,11 +1258,13 @@ flowchart TD
           <button class="reveal">Reveal answer</button>
           <div class="answer">
             <div class="verdict">The in-flight claimed job runs to completion; only <b>new</b> rotations are stopped.</div>
-            <p><code class="r trig">DisableTargetSystem</code> sets the target <span class="state bad">disabled</span>. <code class="r trig">OfferRotation</code>
+            <p><code class="r trig">DisableTargetSystem</code> sets the target <span class="state bad">disabled</span> and audits it
+            (<code class="r trig">AdministrationAudited</code>: <code class="r">target_disabled</code>). <code class="r trig">OfferRotation</code>
             requires <code class="r">target_system.status = active</code>, so no new job is created while disabled — but jobs already
             <span class="state mid">claimed</span> are explicitly unaffected and finish normally. Whether disabling should also cancel a claimed job is the
-            cancel-in-flight open question (today it does not).</p>
-            <div class="rules"><b>Rules:</b> DisableTargetSystem · OfferRotation (guard) · open question: cancel-in-flight</div>
+            cancel-in-flight open question (today it does not); a trigger arriving while disabled is silently dropped, which is the
+            disabled-target catch-up open question.</p>
+            <div class="rules"><b>Rules:</b> DisableTargetSystem · AdministrationAudited (target_disabled) · OfferRotation (guard) · open questions: cancel-in-flight, disabled-target catch-up</div>
           </div>
         </div>
 
@@ -1202,13 +1294,32 @@ flowchart TD
           <div class="answer">
             <div class="verdict">No. The attempt is <span class="state go">rotated</span>; termination is reported as <code class="r">term_failed</code>.</div>
             <p>Session termination is folded <b>into</b> executing the rotation (<code class="r trig">ExecuteRotation</code>), as a best-effort sub-step that
-            runs only after the password is already rotated and the cipher synced. It has its <b>own local retry loop</b> on the daemon's
+            runs only after the password is already rotated, verified and the cipher synced. It has its <b>own local retry loop</b> on the daemon's
             <code class="r">max_retry_attempts</code> / <code class="r">retry_base_delay</code> budget; once those are exhausted it gives up without ever re-running the
             rotation (guarantee <code class="r sur">TerminationNeverFailsRotation</code>). The success report carries
             <code class="r">session_termination = term_failed</code>, which the server records on <code class="r ent">RotationAttempt.session_termination</code>. The
             "requested but unsupported" case can't even arise: <code class="r trig">CreateRotationConfig</code> already validated <code class="r">terminate_sessions</code>
             against the target's <code class="r">supports_session_termination</code> at config time, so that flag is never even sent to the daemon.</p>
             <div class="rules"><b>Rules:</b> ExecuteRotation (termination sub-step, own local retry) · RotationSucceeded(session_termination = term_failed) · RecordRotationSucceeded · guarantee TerminationNeverFailsRotation · CreateRotationConfig (config-time guard)</div>
+          </div>
+        </div>
+
+        <div class="qcard">
+          <div class="scenario">
+            <div class="tagline">Verification</div>
+            <div class="q">The daemon sets the new password in the target system successfully, but the verification step cannot confirm the account authenticates with it — even after the local retries. Is the rotation reported as succeeded, and what does the vault now hold?</div>
+          </div>
+          <button class="reveal">Reveal answer</button>
+          <div class="answer">
+            <div class="verdict">No — it is a failed attempt with <code class="r">sync_state = target_updated</code>, and the stored cipher is stale.</div>
+            <p>Step 4 of <code class="r trig">ExecuteRotation</code> verifies the rotation via the kind integration before anything is reported;
+            guarantee <code class="r sur">VerifiedBeforeSuccess</code> says a rotation is reported succeeded only after the new credential is verified
+            <i>and</i> the cipher write accepted — an unverified change is never a success. Here the target was already changed but the vault was not,
+            so the daemon reports <code class="r trig">RotationAttemptFailed</code> with <span class="state mid">target_updated</span>: the stored credential
+            is stale until a later attempt converges. The server records it on the errored attempt and it rides on the
+            <code class="r">attempt_failed</code>/<code class="r">failed</code> audit outcomes; a fresh claim generates a fresh password and updates target
+            and cipher together, converging the divergence. (What verification concretely means per kind is an open question.)</p>
+            <div class="rules"><b>Rules:</b> ExecuteRotation (step 4, verify) · RotationAttemptFailed(sync_state = target_updated) · RecordRotationFailed · RetryJob/FailJob (sync_state audited) · guarantee VerifiedBeforeSuccess · open question: verification mechanics per kind</div>
           </div>
         </div>
 

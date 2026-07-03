@@ -6,6 +6,9 @@
 --   Server connection lifecycle
 --   Rotation execution (one try at a rotation), running the integration for the
 --     target-system kind (Entra, MSSQL, CustomScript) carried on the claim
+--   Verification of the rotated credential against the target system before the
+--     rotation is reported succeeded, and reporting the vault<->target sync state a
+--     failed try leaves behind (sync_state on the failure report)
 --   Resolving target-system connection details from daemon-local config, keyed by the
 --     target system's id. The server defines the target system and holds NO connection
 --     details (see rotation-server.allium / TargetSystem); the daemon supplies them.
@@ -228,11 +231,22 @@ surface IntegrationSurface {
         -- terminated on success, term_failed when termination was requested but its own
         -- local retries were exhausted (the rotation still succeeded regardless).
         RotationSucceeded(attempt_id, session_termination)
-        RotationAttemptFailed(attempt_id, reason)
+        -- The rotation failed. sync_state reports where the failure left the vault
+        -- relative to the target: target_unchanged (the target was not modified; the
+        -- stored cipher still matches it), target_updated (the target was changed but
+        -- the cipher was not updated -- the stored credential is stale until a later
+        -- attempt converges), or indeterminate (the daemon cannot tell whether the
+        -- change applied, e.g. a timeout after submission).
+        RotationAttemptFailed(attempt_id, reason, sync_state)
+
+    @guarantee VerifiedBeforeSuccess
+        -- A rotation is reported succeeded only after the new credential has been
+        -- verified against the target system (ExecuteRotation step 4) and the cipher
+        -- write has been accepted. An unverified change is never reported as success.
 
     @guarantee TerminationNeverFailsRotation
         -- Session termination is best-effort and decoupled from rotation success: the
-        -- rotation succeeds once the password is rotated and the cipher is synced. A
+        -- rotation succeeds once the password is rotated, verified and the cipher is synced. A
         -- termination failure is reported as term_failed on a successful rotation, never as
         -- a rotation failure, and never re-runs the rotation.
 }
@@ -400,7 +414,13 @@ rule ExecuteRotation {
     -- 3. Run the kind integration (entra | mssql | custom_script) to update the account
     --    identified by account_identity (an opaque target-system identifier) in the target
     --    system, using creds.
-    -- 4. Read (GET) the cipher for this attempt, replace its password with the new value
+    -- 4. Verify the rotation: confirm via the kind integration that the account now
+    --    authenticates with the new password (e.g. an authentication probe; the per-kind
+    --    mechanics are an open question). The rotation is not treated as succeeded until
+    --    verification passes; a verification failure that survives the local retries is a
+    --    failed attempt with sync_state target_updated (the target was changed but the
+    --    vault was not).
+    -- 5. Read (GET) the cipher for this attempt, replace its password with the new value
     --    encrypted under session.organization_key (other fields ride along as opaque
     --    ciphertext -- not decrypted), and re-PUT the whole object to the server,
     --    referencing the server-owned attempt_id (today's API has no partial-content
@@ -408,20 +428,22 @@ rule ExecuteRotation {
     --    rotation-server.allium / CipherWriteback, ApiScopedReads). The server authorises
     --    the write against the RotationJob claimed for this attempt -- no separate nonce
     --    (AcceptCipherUpdate) -- and only ever stores ciphertext (ServerZeroKnowledge).
-    -- 5. If terminate_sessions, attempt to terminate active sessions for account_identity on
+    -- 6. If terminate_sessions, attempt to terminate active sessions for account_identity on
     --    the target system as a best-effort follow-on step (see the @guidance below). The
     --    rotation has already succeeded by this point.
-    -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed,
-    -- keyed by attempt_id, which the daemon relays to the server (ReportOutcomeToServer).
+    -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed
+    -- (a failure carries the vault<->target sync_state it left behind), keyed by attempt_id,
+    -- which the daemon relays to the server (ReportOutcomeToServer).
     @guidance
-        -- Steps 2 and 4 use the Bitwarden Rust SDK. Cipher writes require an active
+        -- Steps 2 and 5 use the Bitwarden Rust SDK. Cipher writes require an active
         -- session: without the unlocked organization_key the daemon cannot produce
         -- valid ciphertext, so rotation cannot proceed until authentication succeeds.
         -- A rejected write (stale or not-in-flight job) surfaces as RotationAttemptFailed;
         -- the server then makes the job claimable again so a fresh attempt retries it.
         -- Each attempt is independent and starts from step 1: a fresh password is
         -- generated and both the target system and cipher are updated together, so a
-        -- previous attempt's partial failure never leaves them out of sync. The server
+        -- previous attempt's partial failure is converged by the next success --
+        -- sync_state records the interim divergence. The server
         -- already validated that terminate_sessions implies the target supports session
         -- termination at config time (rotation-server.allium / CreateRotationConfig), so the
         -- daemon never sees a "requested but unsupported" case.
@@ -434,7 +456,16 @@ rule ExecuteRotation {
         -- exhausted (or the error is plainly non-transient); the server's re-claim is the
         -- outer retry for failures that survive them.
         --
-        -- Session termination (step 5) is part of executing the rotation, NOT a separate
+        -- Where a failure leaves the vault relative to the target is reported as
+        -- sync_state on RotationAttemptFailed: a failure before the target accepted the
+        -- change (steps 1-3, with the update known not to have applied) is
+        -- target_unchanged; a step-3 failure where the daemon cannot tell whether the
+        -- update applied (e.g. a timeout after submission) is indeterminate; a failure
+        -- after the target changed -- verification (step 4) or the cipher write (step 5)
+        -- -- is target_updated, meaning the stored cipher is stale until a later attempt
+        -- or rotation converges.
+        --
+        -- Session termination (step 6) is part of executing the rotation, NOT a separate
         -- task. It runs only after the rotation has succeeded and only when
         -- terminate_sessions is set. It has its OWN independent local retry loop using the
         -- same config.max_retry_attempts / config.retry_base_delay budget (mirroring the
@@ -465,15 +496,18 @@ rule ReportOutcomeToServer {
 }
 
 rule ReportFailureToServer {
-    when: RotationAttemptFailed(attempt_id, reason)
+    when: RotationAttemptFailed(attempt_id, reason, sync_state)
     ensures: ReportRotationFailed(
         reporter: credential,
         attempt_id: attempt_id,
-        failure_reason: reason
+        failure_reason: reason,
+        sync_state: sync_state
     )
     @guidance
         -- The rotation failed (local transient retries exhausted, or a plainly
-        -- non-transient error). The daemon reports failed to the server by attempt_id; the
+        -- non-transient error). The daemon reports failed to the server by attempt_id,
+        -- carrying the vault<->target sync_state the failure left behind (recorded on the
+        -- server-owned attempt, rotation-server.allium / FailureSyncState); the
         -- server records the failure and, if the job has retries left, makes it claimable
         -- again for a fresh attempt -- otherwise it fails the job (rotation-server.allium /
         -- RecordRotationFailed -> RetryJob / FailJob). The daemon itself does not retry the
@@ -517,6 +551,8 @@ open question "Read blast radius (residual): the organization key remains the th
 open question "Cipher write granularity: with no partial-content API (Option A), rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the entire cipher (not just its password) and requires a read-before-write. A dedicated partial-update / rotate endpoint would remove the read and tighten write scope to the password field. A separate bearer write-token (a field on the job) would add defence in depth against an ownership-check bug. Both deferred."
 open question "Credential re-issuance: once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon?"
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
+open question "Verification mechanics per kind: step 4 of ExecuteRotation verifies the rotated credential before the rotation is reported succeeded. MSSQL can probe by opening a connection as the rotated login; Entra may not permit a plain password probe (MFA / conditional access can block it) and may need a directory-level confirmation instead; a custom script needs a verify operation in its contract. What does verification concretely mean for each kind, and may a kind opt out?"
+open question "Mid-rotation disconnect: when the daemon's connection drops mid-execution, its claim may be released server-side and re-claimed by another daemon while this one is still acting on the target system (the cipher API is fenced; the target system is not). Should the daemon abort in-flight execution on a connection drop? (See the claim-release race question in rotation-server.allium.)"
 open question "Credential resolver precedence: the default resolver is environment variables, with Bitwarden Secrets Manager and a local config file as pluggable, opt-in resolvers. When more than one is configured, what is the precedence and is it per-target or daemon-wide? (CredentialResolver encapsulates the lookup; the precedence policy is not yet pinned down.)"
 -- Resolved in rotation-server.allium: target systems are defined and managed server-side
 -- as the TargetSystem entity (id, name, method, kind, password policy), with no connection

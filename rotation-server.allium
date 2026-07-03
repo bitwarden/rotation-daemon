@@ -26,7 +26,9 @@ use "./rotation-daemon.allium" as daemon
 --     which daemons may claim a target's jobs; any eligible daemon claims, with
 --     per-daemon recovery when one drops
 --   Server-side job tracking and recovery, retry orchestration across attempts
---   Audit emission for every rotation attempt and outcome (Goal 4)
+--   Audit emission for every operation: every rotation attempt and outcome, and every
+--     administrative operation (Goal 4). The audit log is the authoritative record that
+--     a credential was rotated.
 -- Excludes:
 --   Daemon execution of rotations (governed by rotation-daemon.allium)
 --   The daemon authentication handshake and session lifecycle (modelled in
@@ -115,6 +117,19 @@ value PasswordPolicy {
 --   term_failed   : termination was requested but its local retries were exhausted
 --                   (the rotation still succeeded; see rotation-daemon.allium / ExecuteRotation)
 enum SessionTerminationOutcome { not_requested | terminated | term_failed }
+
+-- The vault<->target sync state a failed attempt leaves behind, reported by the daemon
+-- with the failure and recorded on the errored attempt. Distinguishes a failure that left
+-- the stored cipher still matching the target from one that changed the target without
+-- updating the vault (the stored credential is then stale until a later attempt or
+-- rotation converges). An abandoned attempt reports nothing, so its sync state is unknown
+-- by construction (see the claim-release race open question). Literals deliberately
+-- distinct from every other enum and status set (checker trigger-param inference).
+--   target_unchanged : the target was not modified; the stored cipher still matches it
+--   target_updated   : the target was changed but the cipher was not updated (vault stale)
+--   indeterminate    : the daemon cannot tell whether the change applied (e.g. a timeout
+--                      after submission)
+enum FailureSyncState { target_unchanged | target_updated | indeterminate }
 
 -- Entities
 
@@ -343,6 +358,9 @@ entity RotationAttempt {
     claimed_by: DaemonRegistration
     status: executing | rotated | errored | abandoned
     failure_reason: String? when status = errored
+    -- The vault<->target sync state the failed try left behind (see FailureSyncState):
+    -- whether the target was changed without the cipher being updated.
+    sync_state: FailureSyncState when status = errored
     -- The best-effort session-termination outcome the daemon reported with a success.
     session_termination: SessionTerminationOutcome when status = rotated
 
@@ -380,6 +398,7 @@ rule RegisterDaemon {
         encrypted_organization_key: wrapped_org_key,
         status: enrolled
     )
+    ensures: AdministrationAudited(operation: daemon_registered, name: name, client_id: client_id)
     @guidance
         -- Provisioning follows Secrets Manager's machine-account mechanic. The server
         -- generates the credential as one access-token string,
@@ -408,6 +427,7 @@ rule RevokeDaemon {
     when: RevokeDaemon(registration)
     requires: registration.status = enrolled
     ensures: registration.status = revoked
+    ensures: AdministrationAudited(operation: daemon_revoked, daemon: registration)
     @guidance
         -- Revoking a daemon invalidates its credential. The next time the daemon
         -- interacts its session is revoked (rotation-daemon.allium /
@@ -427,6 +447,7 @@ rule AssignDaemonToTarget {
     requires: target_system.method = automatic
     requires: not exists DaemonTargetAssignment{daemon: daemon, target_system: target_system}
     ensures: DaemonTargetAssignment.created(daemon: daemon, target_system: target_system)
+    ensures: AdministrationAudited(operation: daemon_assigned, daemon: daemon, target_system: target_system)
     @guidance
         -- A pending job for this target waiting for an eligible daemon becomes
         -- claimable by this daemon as soon as it is assigned (and connected) -- no
@@ -435,6 +456,7 @@ rule AssignDaemonToTarget {
 
 rule UnassignDaemonFromTarget {
     when: UnassignDaemonFromTarget(assignment)
+    ensures: AdministrationAudited(operation: daemon_unassigned, daemon: assignment.daemon, target_system: assignment.target_system)
     ensures: not exists assignment
     @guidance
         -- Removing an assignment stops this daemon claiming new rotations for the
@@ -476,6 +498,7 @@ rule RegisterAutomaticTargetSystem {
         supports_session_termination: supports_session_termination,
         status: active
     )
+    ensures: AdministrationAudited(operation: target_registered, name: name)
     @guidance
         -- The daemon rotates this system, so it carries the integration kind, the password
         -- policy new credentials must satisfy, and whether it can terminate sessions. The
@@ -488,6 +511,7 @@ rule RegisterAutomaticTargetSystem {
 rule RegisterManualTargetSystem {
     when: RegisterManualTargetSystem(name)
     ensures: TargetSystem.created(name: name, method: manual, status: active)
+    ensures: AdministrationAudited(operation: target_registered, name: name)
     @guidance
         -- A system with no daemon integration: rotations are recorded out of band (Goal 3).
         -- No kind, password policy or session-termination capability applies.
@@ -497,6 +521,7 @@ rule DisableTargetSystem {
     when: DisableTargetSystem(target_system)
     requires: target_system.status = active
     ensures: target_system.status = disabled
+    ensures: AdministrationAudited(operation: target_disabled, target_system: target_system)
     @guidance
         -- A disabled target system stops new rotations being offered for its
         -- configurations; jobs already claimed are unaffected.
@@ -506,6 +531,7 @@ rule EnableTargetSystem {
     when: EnableTargetSystem(target_system)
     requires: target_system.status = disabled
     ensures: target_system.status = active
+    ensures: AdministrationAudited(operation: target_enabled, target_system: target_system)
 }
 
 -- Rotation configuration
@@ -540,13 +566,24 @@ rule CreateRotationConfig {
         -- path, with no estate-wide migration step.
 }
 
+rule AuditRotationConfigCreated {
+    when: rotation_config: RotationConfig.created
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: config_created)
+    @guidance
+        -- Every operation is audited (Goal 4). A separate reaction rule (rather than an
+        -- emission inside CreateRotationConfig) so the audit event can reference the
+        -- created configuration without let-binding the creation, which would drop the
+        -- checker's creation-status crediting.
+}
+
 rule UpdateRotationSettings {
-    when: UpdateRotationSettings(_, rotation_config, schedule, rotate_on_access_end)
+    when: UpdateRotationSettings(actor, rotation_config, schedule, rotate_on_access_end)
     let next = if schedule != null: NextScheduledTime(schedule, now)
                else: null
     ensures: rotation_config.schedule = schedule
     ensures: rotation_config.rotate_on_access_end = rotate_on_access_end
     ensures: rotation_config.next_rotation_at = next
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: settings_updated, actor: actor)
     @guidance
         -- Editing the triggers recomputes the next scheduled time immediately
         -- (recompute-on-edit). Clearing the schedule (null) leaves the credential
@@ -554,9 +591,10 @@ rule UpdateRotationSettings {
 }
 
 rule PauseRotation {
-    when: PauseRotation(_, rotation_config)
+    when: PauseRotation(actor, rotation_config)
     requires: rotation_config.enabled
     ensures: rotation_config.enabled = false
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: paused, actor: actor)
     @guidance
         -- Pause keeps all configuration and only stops new rotations being triggered
         -- (RotationDue, TriggerRotation and RotateOnAccessEnd all require enabled).
@@ -565,13 +603,14 @@ rule PauseRotation {
 }
 
 rule ResumeRotation {
-    when: ResumeRotation(_, rotation_config)
+    when: ResumeRotation(actor, rotation_config)
     requires: not rotation_config.enabled
     let next = if rotation_config.schedule != null:
                    NextScheduledTime(rotation_config.schedule, now)
                else: null
     ensures: rotation_config.enabled = true
     ensures: rotation_config.next_rotation_at = next
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: resumed, actor: actor)
     @guidance
         -- Resuming recomputes the next scheduled time from now, so a credential
         -- paused across one or more windows does not fire a backlog on resume — the
@@ -653,6 +692,7 @@ rule OfferRotation {
         created_at: now,
         next_claimable_at: now
     )
+    ensures: RotationAudited(rotation_config: rotation_config, outcome: offered, source: source)
     @guidance
         -- The rotation becomes an available job (pending). The server push-notifies
         -- eligible (connected, assigned) daemons so one claims it promptly rather than
@@ -731,19 +771,23 @@ rule RecordRotationSucceeded {
 }
 
 rule RecordRotationFailed {
-    when: ReportRotationFailed(reporter, attempt_id, failure_reason)
+    when: ReportRotationFailed(reporter, attempt_id, failure_reason, sync_state)
     let attempt = RotationAttempt{id: attempt_id}
     requires: exists attempt
     requires: attempt.status = executing
     requires: attempt.claimed_by.client_id = reporter.client_id
     ensures: attempt.status = errored
     ensures: attempt.failure_reason = failure_reason
+    ensures: attempt.sync_state = sync_state
     @guidance
         -- The daemon reported a genuine failure for this attempt. The server transitions the
         -- server-owned attempt executing -> errored (a let-bound single-entity status
-        -- assignment, which IS credited), recording the failure reason. The attempt's
-        -- transition drives RetryJob or FailJob depending on the retry budget. A succeeded
-        -- and a failed report are distinct triggers, so no outcome discriminator is needed.
+        -- assignment, which IS credited), recording the failure reason and the
+        -- vault<->target sync state the failure left behind (FailureSyncState) -- a
+        -- target_updated failure means the stored cipher is stale until a later attempt
+        -- converges. The attempt's transition drives RetryJob or FailJob depending on the
+        -- retry budget. A succeeded and a failed report are distinct triggers, so no
+        -- outcome discriminator is needed.
 }
 
 rule MarkJobSucceeded {
@@ -774,7 +818,7 @@ rule RetryJob {
     ensures: job.status = pending
     ensures: job.claimed_by = null
     ensures: job.next_claimable_at = now + config.retry_base_delay
-    ensures: RotationAudited(rotation_config: cfg, outcome: attempt_failed, source: job.source, reason: attempt.failure_reason)
+    ensures: RotationAudited(rotation_config: cfg, outcome: attempt_failed, source: job.source, reason: attempt.failure_reason, sync_state: attempt.sync_state)
     @guidance
         -- The attempt failed but the job has retries left (fewer failed attempts than
         -- max_attempts): it returns to claimable (pending) after a backoff (exponential in
@@ -794,14 +838,16 @@ rule FailJob {
     requires: not job.has_retry_budget
     ensures: job.status = failed
     ensures: cfg.next_rotation_at = now + config.failure_retry_delay
-    ensures: RotationAudited(rotation_config: cfg, outcome: failed, source: job.source, reason: attempt.failure_reason)
-    ensures: RotationFailed(rotation_config: cfg, reason: attempt.failure_reason)
+    ensures: RotationAudited(rotation_config: cfg, outcome: failed, source: job.source, reason: attempt.failure_reason, sync_state: attempt.sync_state)
+    ensures: RotationFailed(rotation_config: cfg, reason: attempt.failure_reason, sync_state: attempt.sync_state)
     @guidance
         -- Failed attempts exhausted the budget (max_attempts genuine failures). The job
         -- fails; the config is rescheduled to a near-term retry (failure_retry_delay) and
         -- RotationFailed is emitted for the §6.8 failure-handling policy (alerting /
         -- auto-disable), not specified here. The near-term reschedule keeps the credential
-        -- live until §6.8 lands.
+        -- live until §6.8 lands. The last attempt's sync_state rides on both emissions: a
+        -- job that terminally fails target_updated has left the stored cipher stale --
+        -- the audit log carries that fact for §6.8 and operators.
 }
 
 rule JobTimesOut {
@@ -941,19 +987,35 @@ rule RecordManualRotation {
 
 -- Audit
 --
--- RotationAudited is emitted on every rotation attempt and outcome — a claim (the
--- attempt, dispatched), its success (succeeded), a failed attempt that will be retried
--- (attempt_failed), final failure (failed), a released claim after a daemon drop
--- (released), timeout (timed_out), a refused cipher write (write_rejected), and a
--- recorded manual rotation (manual_recorded)
--- (Goal 4). It is a pure sink: no rule chains from it. Durable, append-only,
--- tamper-evident (WORM) storage is the existing Phase 1 audit log's job and is out
--- of scope here; this spec models the event, not its persistence (mirroring
--- pam.allium's LeaseActivationAudited). `source` carries why the rotation fired
--- (scheduled / on_demand / access_end) on every job-derived outcome; `reason` is the
--- daemon's failure_reason on an attempt_failed or failed outcome, or a server-side
--- reason on a timed_out outcome; `actor` is the recording admin on a manual_recorded
--- outcome. Each is absent where it does not apply.
+-- Every operation the server performs is written to the audit log (Goal 4); viewing the
+-- audit log is how an operator can tell a credential was rotated. Two pure-sink events
+-- carry it (no rule chains from either):
+--
+-- RotationAudited is emitted on every configuration and rotation event — a configuration
+-- created (config_created), its triggers edited (settings_updated), paused/resumed
+-- (paused, resumed), a job offered (offered), a claim (the attempt, dispatched), its
+-- success (succeeded), a failed attempt that will be retried (attempt_failed), final
+-- failure (failed), a released claim after a daemon drop (released), timeout (timed_out),
+-- a refused cipher write (write_rejected), and a recorded manual rotation
+-- (manual_recorded). `source` carries why the rotation fired (scheduled / on_demand /
+-- access_end) on every job-derived outcome; `reason` is the daemon's failure_reason on an
+-- attempt_failed or failed outcome, or a server-side reason on a timed_out outcome;
+-- `sync_state` (FailureSyncState) rides on attempt_failed and failed outcomes so the log
+-- records whether a failure left the stored cipher stale; `actor` is the acting admin on
+-- a manual_recorded, settings_updated, paused or resumed outcome. Each is absent where it
+-- does not apply.
+--
+-- AdministrationAudited is emitted on every administrative operation on the fleet and
+-- targets — a daemon registered (daemon_registered), revoked (daemon_revoked), assigned
+-- to / unassigned from a target (daemon_assigned, daemon_unassigned), and a target system
+-- registered / disabled / enabled (target_registered, target_disabled, target_enabled).
+-- Daemon connectivity edges (DaemonConnected/DaemonDisconnected) are liveness
+-- observations, not operations, and are not audited directly; a drop's impact on
+-- in-flight work is audited via the released outcome.
+--
+-- Durable, append-only, tamper-evident (WORM) storage is the existing Phase 1 audit
+-- log's job and is out of scope here; this spec models the events, not their persistence
+-- (mirroring pam.allium's LeaseActivationAudited).
 
 -- Invariants
 
@@ -1162,7 +1224,9 @@ surface RotationOutcomeReporting {
         -- one with an outcome discriminator) keep the value sets disjoint from the entity
         -- status enums, so the checker's trigger-param inference stays unambiguous.
         ReportRotationSucceeded(reporter, attempt_id, session_termination)
-        ReportRotationFailed(reporter, attempt_id, failure_reason)
+        -- A failure also carries the vault<->target sync state it left behind
+        -- (FailureSyncState), recorded on the errored attempt and audited.
+        ReportRotationFailed(reporter, attempt_id, failure_reason, sync_state)
 
     @guarantee OnlyExecutorReports
         -- An outcome is recorded only for an attempt whose claiming daemon is the reporter
@@ -1248,6 +1312,9 @@ open question "Daemon connectivity edges: MarkDaemonConnected/Disconnected react
 open question "Should disabling a target system, pausing a configuration, applying new settings, or unassigning a daemon cancel a claimed job, or only stop new ones being offered? (Today all only stop new ones.)"
 open question "Manual obligation escalation: beyond surfacing awaiting_manual_rotation, should a manual configuration whose obligation stays unmet past a threshold escalate — notify, flag severity, or raise an alert?"
 open question "Access-event emitter binding: which upstream systems wire into AccessGrantEnded (PAM leases, AAP grants, ...)? The signal-shape question is resolved — it carries only the cipher, which uniquely resolves the configuration to rotate (OneConfigPerCipher), so no account_identity is needed — but the concrete set of emitters and how they register against AccessEventReporting is still open."
-open question "On-demand and access-triggered jobs record a source but not the triggering admin (only manual_recorded carries an actor). Should the audit attribute the on-demand actor end to end?"
+open question "On-demand and access-triggered jobs record a source but not the triggering admin (settings_updated, paused, resumed and manual_recorded carry an actor; the job-derived outcomes do not). Should the audit attribute the on-demand actor end to end?"
+open question "Cipher-level 'last rotated' display: should the vault UI show a last-rotated timestamp on the cipher itself, derived by querying the audit log for rotation events (the audit log being the authoritative record that a rotation happened), rather than a field the rotation machinery maintains? RotationConfig.last_rotation_at exists server-side; this question is about surfacing rotation history on the cipher."
+open question "Disabled-target catch-up and dropped triggers: EnableTargetSystem does not recompute its configurations' next_rotation_at (unlike ResumeRotation's recompute-on-resume), so a schedule that came due while the target was disabled may stay dormant after re-enable; and an on-demand TriggerRotation or AccessGrantEnded arriving while the target is disabled is dropped (OfferRotation's guard fails -- no job, no audit, no standing obligation), which for access_end loses a security-relevant rotation. Decide the catch-up semantics on enable and whether dropped triggers should be audited or queued."
+open question "Claim-release race at the target system: ReleaseJob makes a dropped daemon's job claimable again after retry_base_delay, but a network-partitioned daemon may still be mid-rotation against the target when another daemon re-claims; the cipher write is fenced (JobBoundWrite) but the target system is not, so the two can interleave target-side updates and leave the vault and target out of sync until a later rotation converges (an abandoned attempt reports no sync_state by construction). Candidate mitigations: the daemon aborts in-flight execution when its connection drops (see the mid-rotation disconnect question in rotation-daemon.allium), and/or a dedicated release backoff sized to a worst-case rotation duration instead of retry_base_delay."
 open question "Method switching: can an admin move a target system between automatic and manual after creation (and supply/clear its kind, password policy and session-termination capability), and what becomes of its configurations' schedules and any active jobs? (ManualConfigNeverJobbed assumes a target's method is fixed at creation.)"
 open question "Secrets Manager support (Phase 1 non-goal): a future configuration would point at an SM secret rather than a daemon/Cipher. Confirm the offer, claim, recovery, scheduling and audit machinery here carries an SM rotation unchanged, and decide whether to generalise the cipher seam or add a parallel SM configuration."
