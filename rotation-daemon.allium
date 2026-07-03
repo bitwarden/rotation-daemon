@@ -84,12 +84,29 @@ external entity Cipher {
 -- independently of the link. A transient drop (disconnected) reconnects with backoff; a
 -- connection whose authentication is rejected is terminally refused -- the credential is
 -- no good, so the daemon stops rather than reconnecting forever against it (a replacement
--- credential must be provisioned; see the credential re-issuance open question).
+-- credential must be provisioned in place by the server -- rotation-server.allium /
+-- ReissueDaemonCredential -- and the daemon restarted with the new token).
 --
 -- SignalR/WebSockets owns the raw transport: socket setup, keep-alive, and reconnection
 -- with backoff are the library's job, not the daemon's. This entity models only the
 -- outline the daemon's own logic depends on (am I connected? authenticated? do I need to
 -- re-auth or stop?), deliberately not the connection mechanics.
+--
+-- Server-observed connectivity edges (resolved). The server's DaemonConnected /
+-- DaemonDisconnected (rotation-server.allium / DaemonConnectivity) map EXCLUSIVELY to this
+-- authenticated TRANSPORT coming up and down, never to session state:
+--   * connected: raised when this connection becomes connected (OpenConnection, i.e. the
+--     initial session authenticated -- ConnectionAuthenticated -> connected).
+--   * disconnected: raised when this connection leaves connected -- a transient drop
+--     (ServerInterruptsConnection -> disconnected) OR a terminal refusal (RefuseConnection
+--     -> refused, which the server treats as the transport going down). A rejected refresh
+--     or a revocation causes the server to close the transport, and THAT (refused/dropped),
+--     not the session-state change itself, raises disconnected.
+-- A session merely EXPIRING while the transport stays up is NOT a server-observed
+-- disconnect: flipping it would make the server release a healthy daemon's job mid-refresh
+-- (rotation-server.allium / ReleaseJob), and it is unnecessary for eligibility because
+-- ClaimRotation re-validates the OAuth token per claim (rotation-server.allium /
+-- DaemonConnectivity guidance).
 
 entity ServerConnection {
     status: connecting | connected | disconnected | refused
@@ -285,6 +302,22 @@ surface IntegrationSurface {
         -- password -- a custom script doing a change-password rather than a reset --
         -- would make such a failure unrecoverable, so custom scripts must honour this
         -- constraint too (see the custom-script open questions).
+
+    @guarantee NoTargetActionPastSessionLoss
+        -- The daemon never INITIATES a target-side step of a rotation (ExecuteRotation
+        -- step 3 target-update, step 4 verify, step 6 session-termination) unless its
+        -- session is usable AND the claim's execute_by lease deadline
+        -- (rotation-server.allium / RotationJob.execute_by, carried on the claim) has not
+        -- passed. On transport loss or a terminal session (revoked, closed), or once
+        -- execute_by passes, it aborts at the CURRENT step boundary -- never mid-API-call,
+        -- it simply does not start the next target-side step. The aborted attempt goes
+        -- unreported (a report needs a session) and the server abandons it via the existing
+        -- ReleaseJob / JobTimesOut path. A session merely EXPIRED with a refresh in flight is
+        -- not session loss: the daemon pauses at the step boundary until RefreshSession
+        -- completes (bounded by execute_by) and continues in place. Together with the
+        -- server's lease-sized release_delay (rotation-server.allium / ReleaseJob) this fences
+        -- a network-partitioned daemon out of the target before another daemon can re-claim,
+        -- resolving the claim-release race at the target system.
 }
 
 -- Connection lifecycle
@@ -302,7 +335,11 @@ rule DaemonStarts {
         -- connecting; DaemonConnects then authenticates a session over it. The guards
         -- keep one live connection at a time while still allowing a restart after a
         -- terminal refusal -- though a restart with the same rejected credential will
-        -- simply be refused again (see the credential re-issuance open question).
+        -- simply be refused again. Recovery from a refused connection is an operator
+        -- restart with a FRESH credential: the server can reissue one in place
+        -- (rotation-server.allium / ReissueDaemonCredential), which preserves the
+        -- registration identity and its assignments; the operator restarts the daemon with
+        -- the new token and this rule permits that restart.
 }
 
 rule DaemonConnects {
@@ -373,7 +410,9 @@ rule RefuseConnection {
         -- refused: unlike a transient drop (which Reconnect retries with backoff), the
         -- daemon does NOT reconnect, because re-presenting the same rejected credential
         -- would just loop forever. A replacement credential must be provisioned before the
-        -- daemon can connect again (see the credential re-issuance open question).
+        -- daemon can connect again: the server reissues one in place (rotation-server.allium
+        -- / ReissueDaemonCredential), and the operator restarts the daemon with the new
+        -- token (DaemonStarts permits the restart after a terminal refusal).
 }
 
 rule SessionExpires {
@@ -501,7 +540,7 @@ rule ClaimAvailableRotation {
 -- to the server by attempt_id. It holds no attempt entity: all state lives server-side.
 
 rule StartRotation {
-    when: RotationClaimed(attempt_id, target_system_id, target_system_name, kind, password_policy, cipher, account_identity, terminate_sessions)
+    when: RotationClaimed(attempt_id, target_system_id, target_system_name, kind, password_policy, cipher, account_identity, terminate_sessions, execute_by)
     ensures: ExecuteRotation(
         attempt_id: attempt_id,
         target_system_id: target_system_id,
@@ -509,14 +548,17 @@ rule StartRotation {
         password_policy: password_policy,
         cipher: cipher,
         account_identity: account_identity,
-        terminate_sessions: terminate_sessions
+        terminate_sessions: terminate_sessions,
+        execute_by: execute_by
     )
     @guidance
         -- The daemon's claim succeeded (rotation-server.allium / ClaimRotation) and the
         -- server answered it with the work snapshot for the job it claimed, including the
-        -- server-owned attempt_id. The daemon starts executing the rotation directly from
-        -- that snapshot -- it creates no local record. A retry is another claim, answered
-        -- with a fresh snapshot and a fresh attempt_id.
+        -- server-owned attempt_id and the claim's execute_by lease deadline (claimed_at +
+        -- release_delay). The daemon starts executing the rotation directly from that
+        -- snapshot -- it creates no local record -- and never initiates a target-side step
+        -- past execute_by (ExecuteRotation). A retry is another claim, answered with a fresh
+        -- snapshot, attempt_id and execute_by.
         --
         -- RotationClaimed is emitted by the server (rotation-server.allium / ClaimRotation);
         -- the checker may flag this cross-file chained trigger as an unreachable trigger
@@ -525,11 +567,16 @@ rule StartRotation {
 }
 
 rule ExecuteRotation {
-    when: ExecuteRotation(attempt_id, target_system_id, kind, password_policy, cipher, account_identity, terminate_sessions)
+    when: ExecuteRotation(attempt_id, target_system_id, kind, password_policy, cipher, account_identity, terminate_sessions, execute_by)
     let session = DaemonSession{status: active}
     requires: exists session
     let creds = CredentialResolver(target_system_id)
-    -- Steps performed in order:
+    -- Steps performed in order. Each TARGET-SIDE step (3 target-update, 4 verify, 6
+    -- session-termination) is guarded by the step-boundary abort discipline: the daemon
+    -- never INITIATES one unless its session is usable (active, or expired with a refresh
+    -- in flight -- see below) AND the claim's execute_by lease deadline has not passed. It
+    -- never aborts mid-API-call; it just never starts the next target-side step. See the
+    -- IntegrationSurface / NoTargetActionPastSessionLoss guarantee and the @guidance below.
     -- 1. Resolve connection details for the target via CredentialResolver(target_system_id).
     --    The DEFAULT resolver is environment-variable lookup; Bitwarden Secrets Manager and
     --    a local config file are pluggable, opt-in resolvers that can take priority. The
@@ -537,13 +584,13 @@ rule ExecuteRotation {
     -- 2. Generate a new password satisfying password_policy.
     -- 3. Run the kind integration (entra | mssql | custom_script) to update the account
     --    identified by account_identity (an opaque target-system identifier) in the target
-    --    system, using creds.
+    --    system, using creds. TARGET-SIDE: gated by the step-boundary abort discipline.
     -- 4. Verify the rotation: confirm via the kind integration that the account now
     --    authenticates with the new password (e.g. an authentication probe; the per-kind
-    --    mechanics are an open question). The rotation is not treated as succeeded until
-    --    verification passes; a verification failure that survives the local retries is a
-    --    failed attempt with sync_state target_updated (the target was changed but the
-    --    vault was not).
+    --    mechanics are an open question). TARGET-SIDE: gated by the step-boundary abort
+    --    discipline. The rotation is not treated as succeeded until verification passes; a
+    --    verification failure that survives the local retries is a failed attempt with
+    --    sync_state target_updated (the target was changed but the vault was not).
     -- 5. Read (GET) the cipher for this attempt, replace its password with the new value
     --    encrypted under session.organization_key (other fields ride along as opaque
     --    ciphertext -- not decrypted), and re-PUT the whole object to the server,
@@ -554,7 +601,10 @@ rule ExecuteRotation {
     --    (AcceptCipherUpdate) -- and only ever stores ciphertext (ServerZeroKnowledge).
     -- 6. If terminate_sessions, attempt to terminate active sessions for account_identity on
     --    the target system as a best-effort follow-on step (see the @guidance below). The
-    --    rotation has already succeeded by this point.
+    --    rotation has already succeeded by this point. TARGET-SIDE: gated by the
+    --    step-boundary abort discipline like steps 3-4; if the session is lost or execute_by
+    --    passes before it starts, the termination is simply not initiated (it is best-effort
+    --    and already never fails the rotation -- TerminationNeverFailsRotation).
     -- Outcome reported by the IntegrationSurface via RotationSucceeded or RotationAttemptFailed
     -- (a failure carries the vault<->target sync_state it left behind), keyed by attempt_id,
     -- which the daemon relays to the server (ReportOutcomeToServer).
@@ -580,6 +630,45 @@ rule ExecuteRotation {
         -- exhausted (or the error is plainly non-transient); the server's re-claim is the
         -- outer retry for failures that survive them.
         --
+        -- Session loss vs the step-boundary abort (mid-rotation disconnect, resolved). The
+        -- daemon never INITIATES a target-side step (3 target-update, 4 verify, 6
+        -- session-termination) unless its session is usable and the claim's execute_by lease
+        -- deadline (rotation-server.allium / RotationJob.execute_by, carried on the claim)
+        -- has not passed:
+        --   * Transport dropped, or the session in a terminal state (revoked, closed --
+        --     ConnectionDropClosesSessions / HandleSessionRevoked): the daemon ABORTS at the
+        --     current step boundary. It never aborts mid-API-call; it simply never starts the
+        --     next target-side step. Because a report needs a session, the attempt goes
+        --     UNREPORTED -- the server's existing ReleaseJob / JobTimesOut machinery abandons
+        --     it (no new server machinery). A lease-sized release_delay
+        --     (rotation-server.allium / ReleaseJob) then keeps the job un-claimable until this
+        --     daemon's execute_by has passed, so a re-claiming daemon cannot interleave
+        --     target-side updates with this one -- the two halves of the claim-release-race
+        --     fix.
+        --   * execute_by reached: same abort at the step boundary, for the same reason (a
+        --     re-claim may be imminent). Clock skew is absorbed by release_delay's sizing
+        --     margin (rotation-server.allium / config.release_delay).
+        --   * Session EXPIRED with a refresh in flight is NOT session loss: the daemon PAUSES
+        --     at the step boundary and waits for RefreshSession to complete (bounded by
+        --     execute_by), then continues in place. See the token-expiry paragraph below.
+        -- This is the behavioural content of the IntegrationSurface /
+        -- NoTargetActionPastSessionLoss guarantee.
+        --
+        -- Token expiry mid-rotation is ROUTINE, not a failure (resolved). Short-lived access
+        -- tokens will straddle a long rotation, so an expired access token during any
+        -- SERVER-FACING step (the cipher GET/PUT of step 5, or the outcome report) is a
+        -- TRANSIENT fault: it is absorbed by the local retry loop while the existing
+        -- SessionExpires -> RefreshSession -> active cycle completes, and the attempt
+        -- continues in place. Token expiry must NEVER fail an attempt -- an errored attempt
+        -- consumes the server's retry budget (rotation-server.allium / max_attempts), which
+        -- is wrong for routine housekeeping. Only a REJECTED refresh (the credential was
+        -- revoked mid-rotation -- HandleAuthenticationRejected -> the session goes revoked)
+        -- ends execution: that is session loss per the paragraph above -- the daemon aborts
+        -- at the step boundary, the attempt goes unreported, and the server abandons it.
+        -- (ExecuteRotationWithoutSession stays fail-fast, but it covers only the claim-to-
+        -- start gap, before any step has run -- nothing target-side has happened, so failing
+        -- fast there costs nothing and is not the mid-execution case.)
+        --
         -- Where a failure leaves the vault relative to the target is reported as
         -- sync_state on RotationAttemptFailed: a failure before the target accepted the
         -- change (steps 1-3, with the update known not to have applied) is
@@ -600,7 +689,7 @@ rule ExecuteRotation {
 }
 
 rule ExecuteRotationWithoutSession {
-    when: ExecuteRotation(attempt_id, target_system_id, kind, password_policy, cipher, account_identity, terminate_sessions)
+    when: ExecuteRotation(attempt_id, target_system_id, kind, password_policy, cipher, account_identity, terminate_sessions, execute_by)
     requires: not exists DaemonSession{status: active}
     ensures: RotationAttemptFailed(attempt_id: attempt_id, reason: "no active session", sync_state: target_unchanged)
     @guidance
@@ -687,12 +776,43 @@ invariant AtMostOneActiveSession {
 -- entity. Its outcome rides on the success report (RotationSucceeded.session_termination).
 open question "Read blast radius (residual): the organization key remains the theoretical crypto blast radius -- a daemon compromise combined with an API-authorization bypass would expose the org vault. Closing it at the crypto layer (so a stolen key alone reveals nothing beyond the managed cipher) needs per-cipher item keys (delivered per attempt, job-bound) or a write-only asymmetric scheme; both depend on Bitwarden per-item cipher keys. Deferred."
 open question "Cipher write granularity: with no partial-content API (Option A), rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the entire cipher (not just its password) and requires a read-before-write. A dedicated partial-update / rotate endpoint would remove the read and tighten write scope to the password field. A separate bearer write-token (a field on the job) would add defence in depth against an ownership-check bug. Both deferred."
-open question "Credential re-issuance: once a daemon's credential is revoked the session is terminal. How is a replacement credential provisioned and delivered to the daemon?"
+-- Resolved: credential re-issuance is ReissueDaemonCredential (rotation-server.allium),
+-- an admin action on DaemonRegistrationView. It generates a fresh client_secret and
+-- encryption_key, re-wraps the org key (WrapOrganizationKeyForDaemon), replaces the stored
+-- encrypted_organization_key, and invalidates any live session (the server closes the
+-- daemon's transport; the old credential no longer authenticates, so the daemon's reconnect
+-- is refused -- HandleAuthenticationRejected / RefuseConnection -- until the operator
+-- restarts it with the new token, which DaemonStarts permits after a terminal refusal). The
+-- new token is shown once and delivered out of band, exactly like RegisterDaemon. Reissue
+-- PRESERVES the registration identity, so DaemonTargetAssignments and audit continuity
+-- survive credential rotation/compromise; RevokeDaemon remains permanent decommission
+-- (terminal -- recovery from revoked is a NEW registration + reassignment, by design).
 open question "Custom script result format: exit code, stdout parsing, or structured output? Exit code is simplest and most portable."
 open question "Verification mechanics per kind: step 4 of ExecuteRotation verifies the rotated credential before the rotation is reported succeeded. MSSQL can probe by opening a connection as the rotated login; Entra may not permit a plain password probe (MFA / conditional access can block it) and may need a directory-level confirmation instead; a custom script needs a verify operation in its contract. What does verification concretely mean for each kind, and may a kind opt out?"
-open question "Mid-rotation disconnect: when the daemon's connection drops mid-execution, its claim may be released server-side and re-claimed by another daemon while this one is still acting on the target system (the cipher API is fenced; the target system is not). Should the daemon abort in-flight execution on a connection drop? (See the claim-release race question in rotation-server.allium.)"
+-- Resolved: abort at step boundaries. The daemon never INITIATES a target-side step
+-- (ExecuteRotation step 3 target-update, 4 verify, 6 session-termination) unless its
+-- session is usable and the claim's execute_by lease deadline has not passed. On transport
+-- loss or a terminal session (revoked, closed), or once execute_by passes, it aborts at the
+-- current step boundary -- never mid-API-call, just never starting the next target-side
+-- step. The aborted attempt goes unreported (a report needs a session) and the server's
+-- existing ReleaseJob / JobTimesOut machinery abandons it (no new server machinery). A
+-- session merely expired with a refresh in flight is NOT session loss (pause and wait,
+-- bounded by execute_by; see the token-expiry resolution below). This is the
+-- IntegrationSurface / NoTargetActionPastSessionLoss guarantee and the ExecuteRotation
+-- guidance; paired with the server's lease-sized release_delay (rotation-server.allium /
+-- ReleaseJob, config.release_delay) it resolves the claim-release race at the target system.
 open question "Credential resolver precedence: the default resolver is environment variables, with Bitwarden Secrets Manager and a local config file as pluggable, opt-in resolvers. When more than one is configured, what is the precedence and is it per-target or daemon-wide? (CredentialResolver encapsulates the lookup; the precedence policy is not yet pinned down.)"
-open question "Token expiry mid-rotation: the access token can lapse between claiming a job and the cipher write (ExecuteRotation step 5). ExecuteRotationWithoutSession covers only the claim-to-start gap; mid-execution, should the daemon pause and re-authenticate in place (the local transient-retry budget absorbing the refresh), or fail the attempt with the sync_state it has reached?"
+-- Resolved: refresh in place. An expired access token during any server-facing step
+-- (the cipher GET/PUT of ExecuteRotation step 5, or the outcome report) is a TRANSIENT
+-- fault absorbed by the local retry loop while the existing SessionExpires -> RefreshSession
+-- -> active cycle completes; the attempt continues in place. Token expiry is routine
+-- (short-lived tokens straddle long rotations) and must NEVER fail an attempt -- an errored
+-- attempt consumes the server's retry budget (rotation-server.allium / max_attempts), wrong
+-- for housekeeping. Only a REJECTED refresh (credential revoked mid-rotation) ends
+-- execution: that is session loss per the mid-rotation-disconnect resolution above -- abort
+-- at the step boundary, the attempt goes unreported, the server abandons it.
+-- ExecuteRotationWithoutSession stays fail-fast for the claim-to-start gap (nothing
+-- target-side has run yet).
 -- Resolved in rotation-server.allium: target systems are defined and managed server-side
 -- as the TargetSystem entity (id, name, method, kind, password policy), with no connection
 -- details; the daemon resolves those locally by id via CredentialResolver.
