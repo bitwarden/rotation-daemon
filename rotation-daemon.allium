@@ -3,7 +3,9 @@
 
 -- Scope: Credential rotation daemon for Bitwarden
 -- Includes:
---   Server connection lifecycle
+--   Daemon startup (creating the transport) and server connection lifecycle
+--   Work acquisition: claiming server-notified jobs (ClaimAvailableRotation) -- the
+--     daemon's side of the pull model; job/attempt state stays server-side
 --   Rotation execution (one try at a rotation), running the integration for the
 --     target-system kind (Entra, MSSQL, CustomScript) carried on the claim
 --   Verification of the rotated credential against the target system before the
@@ -19,12 +21,13 @@
 --   Bitwarden Secrets Manager internals (external system)
 --   Password generation algorithm internals
 --   Deployment and containerisation (Docker, etc.)
---   Rotation scheduling, the claim/pull mechanism, the RotationAttempt record, and retry
+--   Rotation scheduling, job/claim orchestration, the RotationAttempt record, and retry
 --     orchestration across attempts -- all server-side (rotation-server.allium). The
---     daemon is a pure client: on each claim it receives a self-contained work snapshot,
---     executes a single try against it, and reports the outcome back to the server (which
---     owns the RotationAttempt). A retry is a fresh claim the server makes, with a fresh
---     snapshot. The daemon holds NO attempt entity of its own.
+--     daemon is a pure client: it claims a notified job (ClaimAvailableRotation), receives
+--     a self-contained work snapshot in answer, executes a single try against it, and
+--     reports the outcome back to the server (which owns the RotationAttempt). A retry is
+--     a fresh claim against the same server-side job, answered with a fresh snapshot. The
+--     daemon holds NO attempt entity of its own.
 
 config {
     -- The daemon's small, local retry budget for absorbing TRANSIENT glitches within
@@ -95,6 +98,7 @@ entity ServerConnection {
         connecting -> connected
         connecting -> refused
         connected -> disconnected
+        connected -> refused
         disconnected -> connecting
         terminal: refused
     }
@@ -145,7 +149,12 @@ entity DaemonSession {
     id: String
     connection: ServerConnection
     credential: DaemonCredential
-    status: authenticating | active | expired | revoked
+    -- closed: the session's transport dropped (ConnectionDropClosesSessions). Terminal,
+    -- like revoked, but semantically distinct: the credential is still good, and the
+    -- reconnected transport gets a FRESH session (DaemonConnects) -- a dropped session is
+    -- never resumed. Closing the old session on the drop is what upholds
+    -- AtMostOneActiveSession across reconnects.
+    status: authenticating | active | expired | revoked | closed
     access_token: String when status = active
     expires_at: Timestamp when status = active
     organization_key: String when status = active
@@ -153,10 +162,13 @@ entity DaemonSession {
     transitions status {
         authenticating -> active
         authenticating -> revoked
+        authenticating -> closed
         active -> expired
         active -> revoked
+        active -> closed
         expired -> authenticating
-        terminal: revoked
+        expired -> closed
+        terminal: revoked, closed
     }
 }
 
@@ -174,8 +186,11 @@ deferred CredentialResolver    -- see: daemon-local credential resolution (defau
 
 -- Actors
 
+-- The Bitwarden server as the party on the far side of the daemon's transport. It is
+-- code, not a person; identified minimally by the connection the daemon holds to it --
+-- any connection that has not been terminally refused may carry server-originated events.
 actor BitwardenServer {
-    identified_by: connection.endpoint
+    identified_by: ServerConnection where status != refused
 }
 
 -- The target-system integration the daemon runs (Entra Graph, a SQL Server, a custom
@@ -187,6 +202,16 @@ actor Integration {
 }
 
 -- Surfaces
+
+surface DaemonLifecycle {
+    -- The daemon process boundary: whoever runs the daemon (an operator, a service
+    -- manager, a container runtime) starts it with its provisioned credential. Starting
+    -- the daemon is what brings the transport into being (DaemonStarts).
+    facing host: DaemonCredential
+
+    provides:
+        DaemonStarts(host)
+}
 
 surface BitwardenServerSurface {
     facing _: BitwardenServer
@@ -249,9 +274,36 @@ surface IntegrationSurface {
         -- rotation succeeds once the password is rotated, verified and the cipher is synced. A
         -- termination failure is reported as term_failed on a successful rotation, never as
         -- a rotation failure, and never re-runs the rotation.
+
+    @guarantee RotationByAdministrativeReset
+        -- Every integration rotates by administrative reset: no step of a rotation may
+        -- depend on the CURRENT credential value (the integration authenticates with the
+        -- resolver-supplied service credentials, never with the password being rotated).
+        -- This is what makes retry-convergence sound: after a target_updated failure (the
+        -- target changed, the vault stale), the next attempt's independently generated
+        -- fresh password can still be applied. An integration that needed the old
+        -- password -- a custom script doing a change-password rather than a reset --
+        -- would make such a failure unrecoverable, so custom scripts must honour this
+        -- constraint too (see the custom-script open questions).
 }
 
 -- Connection lifecycle
+
+rule DaemonStarts {
+    when: DaemonStarts(host)
+    -- No live connection in any non-terminal state: the daemon holds one transport at a
+    -- time. Only a refused (terminal) connection may be left behind, permitting a restart.
+    requires: not exists ServerConnection{status: connecting}
+    requires: not exists ServerConnection{status: connected}
+    requires: not exists ServerConnection{status: disconnected}
+    ensures: ServerConnection.created(status: connecting)
+    @guidance
+        -- Starting the daemon creates its (single) transport to the server, beginning in
+        -- connecting; DaemonConnects then authenticates a session over it. The guards
+        -- keep one live connection at a time while still allowing a restart after a
+        -- terminal refusal -- though a restart with the same rejected credential will
+        -- simply be refused again (see the credential re-issuance open question).
+}
 
 rule DaemonConnects {
     when: connection: ServerConnection.status becomes connecting
@@ -270,28 +322,38 @@ rule DaemonConnects {
 rule HandleAuthenticationSucceeded {
     when: AuthenticationSucceeded(session, access_token, expires_at, encrypted_organization_key)
     requires: session.status = authenticating
-    requires: session.connection.status = connecting
     let organization_key = UnwrapOrganizationKey(encrypted_organization_key, session.credential.encryption_key)
     ensures: session.status = active
     ensures: session.access_token = access_token
     ensures: session.expires_at = expires_at
     ensures: session.organization_key = organization_key
-    ensures: ConnectionAuthenticated(connection: session.connection)
+    ensures:
+        if session.connection.status = connecting:
+            ConnectionAuthenticated(connection: session.connection)
     @guidance
         -- The server returns a short-lived access token and the wrapped organization key
         -- (encrypted_organization_key -- the blob it stored at registration). The daemon
         -- unwraps it locally with its credential.encryption_key (UnwrapOrganizationKey) to
         -- get the plaintext org key it holds for the session; the key never crosses the
-        -- boundary in the clear (ServerZeroKnowledge). The connection is signalled ready only
-        -- once authentication succeeds (see OpenConnection).
+        -- boundary in the clear (ServerZeroKnowledge). This rule covers BOTH initial
+        -- authentication (connection still connecting) and a mid-connection token refresh
+        -- (RefreshSession, connection already connected): the access token expires and
+        -- refreshes many times within the life of one connection, so the connection-status
+        -- guard must not exclude the refresh. Only on initial authentication is the
+        -- connection signalled ready (ConnectionAuthenticated -> OpenConnection); a refresh
+        -- leaves the already-connected transport untouched.
 }
 
 rule HandleAuthenticationRejected {
     when: AuthenticationRejected(session)
     requires: session.status = authenticating
-    requires: session.connection.status = connecting
     ensures: session.status = revoked
     ensures: ConnectionRefused(connection: session.connection)
+    @guidance
+        -- Covers both a rejected initial authentication (connection connecting) and a
+        -- rejected mid-connection refresh (credential revoked while the transport was up):
+        -- in both cases the credential is no good, the session is revoked and the
+        -- connection is terminally refused (RefuseConnection accepts either state).
 }
 
 rule OpenConnection {
@@ -302,23 +364,31 @@ rule OpenConnection {
 
 rule RefuseConnection {
     when: ConnectionRefused(connection)
-    requires: connection.status = connecting
+    requires: connection.status in {connecting, connected}
     ensures: connection.status = refused
     @guidance
-        -- Authentication was rejected -- a bad or revoked credential. The connection is
-        -- terminally refused: unlike a transient drop (which Reconnect retries with
-        -- backoff), the daemon does NOT reconnect, because re-presenting the same rejected
-        -- credential would just loop forever. A replacement credential must be provisioned
-        -- before the daemon can connect again (see the credential re-issuance open question).
+        -- Authentication was rejected -- a bad or revoked credential. This happens either
+        -- during connection establishment (connecting) or when a mid-connection token
+        -- refresh is rejected (connected). Either way the connection is terminally
+        -- refused: unlike a transient drop (which Reconnect retries with backoff), the
+        -- daemon does NOT reconnect, because re-presenting the same rejected credential
+        -- would just loop forever. A replacement credential must be provisioned before the
+        -- daemon can connect again (see the credential re-issuance open question).
 }
 
 rule SessionExpires {
     when: session: DaemonSession.expires_at <= now
     requires: session.status = active
     ensures: session.status = expired
+    ensures: session.access_token = null
+    ensures: session.expires_at = null
+    ensures: session.organization_key = null
     @guidance
         -- The access token has a short lifetime. Once it lapses the daemon must
-        -- re-authenticate before it can claim or execute further rotations.
+        -- re-authenticate before it can claim or execute further rotations. The token,
+        -- expiry and organization key exist only while the session is active
+        -- (when-gated), so leaving active clears them; re-authentication re-derives all
+        -- three from the fresh response (HandleAuthenticationSucceeded).
 }
 
 rule RefreshSession {
@@ -334,6 +404,9 @@ rule HandleSessionRevoked {
     when: SessionRevoked(session)
     requires: session.status = active
     ensures: session.status = revoked
+    ensures: session.access_token = null
+    ensures: session.expires_at = null
+    ensures: session.organization_key = null
     @guidance
         -- The server can revoke a daemon's credential (e.g. an admin revokes the
         -- daemon, see rotation-server.allium / RevokeDaemon). The session becomes
@@ -348,6 +421,34 @@ rule ServerInterruptsConnection {
     ensures: connection.status = disconnected
 }
 
+rule ConnectionDropClosesSessions {
+    when: conn: ServerConnection.status transitions_to disconnected
+    for session in DaemonSessions where connection = conn and status in {authenticating, active, expired}:
+        ensures: CloseSession(session: session)
+    @guidance
+        -- A dropped transport takes its session with it: whatever state the session was
+        -- in, it is closed (terminally) and the reconnected transport authenticates a
+        -- fresh one (Reconnect -> DaemonConnects). Without this, the old session would
+        -- linger active until its token lapsed -- two active sessions after a fast
+        -- reconnect, violating AtMostOneActiveSession -- and would then zombie back
+        -- through expired -> authenticating, competing for authentication responses.
+}
+
+rule CloseActiveSession {
+    when: CloseSession(session)
+    requires: session.status = active
+    ensures: session.status = closed
+    ensures: session.access_token = null
+    ensures: session.expires_at = null
+    ensures: session.organization_key = null
+}
+
+rule CloseIdleSession {
+    when: CloseSession(session)
+    requires: session.status in {authenticating, expired}
+    ensures: session.status = closed
+}
+
 rule Reconnect {
     when: connection: ServerConnection.status transitions_to disconnected
     requires: connection.status = disconnected
@@ -359,13 +460,36 @@ rule Reconnect {
         -- the daemon; this rule does not re-specify them.
 }
 
-rule ConnectionEstablished {
-    when: _: ServerConnection.status transitions_to connected
-    -- Once connected and authenticated, the daemon pulls work: it claims jobs it is
-    -- eligible for (rotation-server.allium / ClaimRotation), prompted by the server's
-    -- availability notifications. Each claim makes the server create a RotationAttempt for
-    -- this daemon and answer with the work snapshot (rotation-server.allium /
-    -- RotationClaimed), which the daemon executes (StartRotation).
+-- Work acquisition (pull with a push nudge)
+--
+-- Once connected and authenticated, the daemon pulls work. The server notifies it of
+-- claimable jobs (rotation-server.allium / RotationAvailable) -- both when a job is
+-- offered and, as a catch-up, when the daemon (re)connects -- and the daemon claims each
+-- notified job by invoking the server's RotationWork surface (ClaimRotation). The job
+-- reference is opaque to the daemon (like the rest of the snapshot shapes): eligibility
+-- (enrolled, connected, assigned, job still claimable) is enforced entirely server-side.
+-- Each accepted claim makes the server create a RotationAttempt for this daemon and
+-- answer with the work snapshot (rotation-server.allium / RotationClaimed), which the
+-- daemon executes (StartRotation).
+
+rule ClaimAvailableRotation {
+    when: RotationAvailable(job)
+    let session = DaemonSession{status: active}
+    requires: exists session
+    ensures: ClaimRotation(claimer: credential, job: job)
+    @guidance
+        -- The daemon claims only while it holds an active (authenticated) session; a
+        -- notification arriving while unauthenticated is simply not acted on -- the job
+        -- stays pending server-side and a later notification (e.g. the on-connect
+        -- catch-up) reaches it again. First claim wins among eligible daemons, so a lost
+        -- race is not an error: the server refuses the late claim and this daemon moves on.
+        --
+        -- RotationAvailable is emitted by the server (rotation-server.allium /
+        -- NotifyEligibleDaemons / NotifyClaimableJobsOnConnect) and ClaimRotation is a
+        -- server-side surface action (rotation-server.allium / RotationWork) the daemon
+        -- invokes as the claiming party; the checker may flag both as cross-file
+        -- unreachable triggers (INFO). That is expected and benign for a server <-> daemon
+        -- chain.
 }
 
 -- Rotation execution
@@ -475,6 +599,20 @@ rule ExecuteRotation {
         -- false), terminated (succeeded), or term_failed (its local retries exhausted).
 }
 
+rule ExecuteRotationWithoutSession {
+    when: ExecuteRotation(attempt_id, target_system_id, kind, password_policy, cipher, account_identity, terminate_sessions)
+    requires: not exists DaemonSession{status: active}
+    ensures: RotationAttemptFailed(attempt_id: attempt_id, reason: "no active session", sync_state: target_unchanged)
+    @guidance
+        -- The session lapsed (or was revoked) between claiming and executing -- rare,
+        -- since ClaimAvailableRotation requires an active session, but the token can
+        -- expire in the gap. Without the org key the daemon cannot produce valid
+        -- ciphertext, so rather than stalling the claimed job until the server's job_ttl
+        -- backstop (rotation-server.allium / JobTimesOut), the attempt fails fast with
+        -- nothing done (sync_state target_unchanged); the server re-offers the job and a
+        -- re-authenticated daemon re-claims it.
+}
+
 rule ReportOutcomeToServer {
     when: RotationSucceeded(attempt_id, session_termination)
     ensures: ReportRotationSucceeded(
@@ -554,6 +692,7 @@ open question "Custom script result format: exit code, stdout parsing, or struct
 open question "Verification mechanics per kind: step 4 of ExecuteRotation verifies the rotated credential before the rotation is reported succeeded. MSSQL can probe by opening a connection as the rotated login; Entra may not permit a plain password probe (MFA / conditional access can block it) and may need a directory-level confirmation instead; a custom script needs a verify operation in its contract. What does verification concretely mean for each kind, and may a kind opt out?"
 open question "Mid-rotation disconnect: when the daemon's connection drops mid-execution, its claim may be released server-side and re-claimed by another daemon while this one is still acting on the target system (the cipher API is fenced; the target system is not). Should the daemon abort in-flight execution on a connection drop? (See the claim-release race question in rotation-server.allium.)"
 open question "Credential resolver precedence: the default resolver is environment variables, with Bitwarden Secrets Manager and a local config file as pluggable, opt-in resolvers. When more than one is configured, what is the precedence and is it per-target or daemon-wide? (CredentialResolver encapsulates the lookup; the precedence policy is not yet pinned down.)"
+open question "Token expiry mid-rotation: the access token can lapse between claiming a job and the cipher write (ExecuteRotation step 5). ExecuteRotationWithoutSession covers only the claim-to-start gap; mid-execution, should the daemon pause and re-authenticate in place (the local transient-retry budget absorbing the refresh), or fail the attempt with the sync_state it has reached?"
 -- Resolved in rotation-server.allium: target systems are defined and managed server-side
 -- as the TargetSystem entity (id, name, method, kind, password policy), with no connection
 -- details; the daemon resolves those locally by id via CredentialResolver.
