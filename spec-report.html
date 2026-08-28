@@ -238,7 +238,10 @@
   details.oq summary::before { content: "+ "; color: var(--brand); font-weight: 700; }
   details.oq[open] summary::before { content: "– "; }
   details.oq .oqbody { padding: 0 0 14px; color: var(--ink-dim); font-size: 14px; }
+  details.oq.res summary::before { content: "✓ "; color: var(--good); }
+  details.oq.res[open] summary::before { content: "– "; color: var(--good); }
   .oqtag { font-size: 11px; text-transform: uppercase; letter-spacing:.5px; border:1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--ink-faint); margin-left:8px; }
+  .oqtag.res { color: var(--good); border-color: #2d5b3f; }
 
   .legend { display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px; color: var(--ink-dim); margin: 4px 0 0; }
   .legend span::before { content:"●"; margin-right:6px; }
@@ -261,7 +264,7 @@
       <li><a href="#lifecycles">4 · Lifecycle diagrams</a></li>
       <li><a href="#flows">5 · End-to-end flows</a></li>
       <li><a href="#crosscutting">6 · Cross-cutting topics</a></li>
-      <li><a href="#openq">7 · Open questions</a></li>
+      <li><a href="#openq">7 · Open questions &amp; resolutions</a></li>
       <li><a href="#scenarios">8 · User-story scenarios</a></li>
     </ol>
   </nav>
@@ -316,7 +319,9 @@ flowchart TD
         <div class="card">
           <h4>Pull-based jobs</h4>
           <p class="muted">When a rotation becomes due the server publishes an available <code class="r ent">RotationJob</code>.
-          It does not push work at a daemon; an <i>eligible</i> daemon <b>claims</b> the job. A retry is just a re-claim.</p>
+          It does not push work at a daemon; an <i>eligible</i> daemon <b>claims</b> the job (a push <i>nudge</i> announces it —
+          on creation, on daemon reconnect and on a late assignment). A retry is just a re-claim, and each claim is a
+          time-bounded <b>lease</b>.</p>
         </div>
         <div class="card">
           <h4>One attempt per claim</h4>
@@ -358,9 +363,10 @@ flowchart TD
             <li>Target-system definitions (<code class="r ent">TargetSystem</code>) — name, method, kind, password policy, status. <b>No connection details.</b></li>
             <li>Daemon identities &amp; eligibility (<code class="r ent">DaemonRegistration</code>, <code class="r ent">DaemonTargetAssignment</code>, <code class="r ent">DaemonConnection</code>).</li>
             <li>Rotation configuration &amp; triggers (<code class="r ent">RotationConfig</code>, with an inline <code class="r">Schedule?</code> + <code class="r">rotate_on_access_end</code>).</li>
-            <li>Scheduling, dispatch, job tracking, retry orchestration, timeout, recovery (<code class="r ent">RotationJob</code>).</li>
+            <li>Scheduling, dispatch, job tracking, retry orchestration, timeout, recovery (<code class="r ent">RotationJob</code>) — and the claim lease (<code class="r">claimed_at</code> + <code class="r">release_delay</code> ⇒ <code class="r">execute_by</code>).</li>
             <li>Rotation attempts (<code class="r ent">RotationAttempt</code>) — created on claim; their lifecycle and outcome, recorded from the daemon's report.</li>
             <li>Cipher-write authorisation and audit emission — every operation, rotation and administrative alike (<code class="r trig">RotationAudited</code> + <code class="r trig">AdministrationAudited</code>).</li>
+            <li>The §6.8 failure policy: operator alerting and auto-pause after consecutive failures (the pure-sink <code class="r trig">OperatorAlertRaised</code>).</li>
           </ul>
         </div>
         <div class="card">
@@ -371,6 +377,7 @@ flowchart TD
             <li>Resolving connection details via the env-first <code class="r">CredentialResolver</code>, keyed by <code class="r">target_system_id</code> (Secrets Manager and local config are pluggable, opt-in resolvers).</li>
             <li>Generating a policy-compliant password, verifying the rotated credential against the target system, and writing back the encrypted cipher.</li>
             <li>Best-effort session termination as a sub-step of the attempt (its own local retry budget) and local transient retry.</li>
+            <li>The step-boundary abort discipline: never initiating a target-side step past session loss or the claim's <code class="r">execute_by</code> lease (guarantee <code class="r sur">NoTargetActionPastSessionLoss</code>).</li>
           </ul>
         </div>
       </div>
@@ -429,12 +436,12 @@ flowchart LR
             per-credential mode — automatic vs manual is the target's <code class="r">method</code>.</div>
           <div class="fields">
             <div class="f"><div class="k">id</div><div class="v">Stable identifier; the daemon keys its local connection config off this.</div></div>
-            <div class="f"><div class="k">name</div><div class="v">Human-readable name.</div></div>
-            <div class="f"><div class="k">method</div><div class="v"><span class="state">automatic</span> (daemon rotates it) or <span class="state">manual</span> (recorded out of band).</div></div>
-            <div class="f"><div class="k">kind</div><div class="v"><span class="state">entra</span> / <span class="state">mssql</span> / <span class="state">custom_script</span> — selects the integration. Present <b>only when</b> automatic.</div></div>
-            <div class="f"><div class="k">password_policy</div><div class="v">Constraints a generated password must meet. Present only when automatic.</div></div>
-            <div class="f"><div class="k">supports_session_termination</div><div class="v">Whether the target can terminate active sessions. Present only when automatic.</div></div>
-            <div class="f"><div class="k">status</div><div class="v"><span class="state go">active</span> / <span class="state bad">disabled</span> — disabling stops new rotations being offered (claimed jobs unaffected).</div></div>
+            <div class="f"><div class="k">name</div><div class="v">Human-readable name. Editable (<code class="r trig">RenameTargetSystem</code>) — display only; the id, which keys the daemon's resolver, never changes.</div></div>
+            <div class="f"><div class="k">method</div><div class="v"><span class="state">automatic</span> (daemon rotates it) or <span class="state">manual</span> (recorded out of band). Fixed at creation (method switching is an open question).</div></div>
+            <div class="f"><div class="k">kind</div><div class="v"><span class="state">entra</span> / <span class="state">mssql</span> / <span class="state">custom_script</span> — selects the integration. Present <b>only when</b> automatic. Deliberately <b>immutable</b>: account identities are interpreted by the kind, so changing it would invalidate them.</div></div>
+            <div class="f"><div class="k">password_policy</div><div class="v">Constraints a generated password must meet. Present only when automatic. Editable (<code class="r trig">UpdateTargetSystemPolicy</code>) — the policy rides on each claim, so an update applies to the <i>next</i> attempt of every credential on this target.</div></div>
+            <div class="f"><div class="k">supports_session_termination</div><div class="v">Whether the target can terminate active sessions. Present only when automatic. Editable via <code class="r trig">UpdateTargetSystemPolicy</code>, but withdrawable only while no config has <code class="r">terminate_sessions</code> set (preserving the config-time guarantee).</div></div>
+            <div class="f"><div class="k">status</div><div class="v"><span class="state go">active</span> / <span class="state bad">disabled</span> — disabling stops new rotations being offered <b>and holds pending jobs un-claimable</b> (claimed jobs unaffected). Re-enabling catches up: schedules recomputed (missed windows skipped), deferred access-ends discharged.</div></div>
           </div>
         </div>
       </div>
@@ -443,17 +450,21 @@ flowchart LR
         <div class="head"><span class="name">RotationConfig</span><span class="tag owner-srv">server</span><span class="tag">entity</span></div>
         <div class="body">
           <div class="desc">Links one <code class="r ent">Cipher</code> to a <code class="r ent">TargetSystem</code> and carries its triggers and schedule state.
-            A cipher has at most one config (<code class="r">OneConfigPerCipher</code>), so the cipher uniquely identifies what to rotate.</div>
+            A cipher has at most one config (<code class="r">OneConfigPerCipher</code>), so the cipher uniquely identifies what to rotate.
+            Deletable (<code class="r trig">DeleteRotationConfig</code>) while no job is active — its resolved jobs and attempts go with it; the cipher and the audit log (the authoritative rotation history) are untouched.</div>
           <div class="fields">
             <div class="f"><div class="k">cipher</div><div class="v"><code class="r ent">daemon/Cipher</code> — the vault item whose password is rotated. (The SM seam: a future config could point at an SM secret.)</div></div>
             <div class="f"><div class="k">target_system</div><div class="v">Which target this credential lives in.</div></div>
-            <div class="f"><div class="k">account_identity</div><div class="v">Opaque <code class="r">String</code> — the account's identifier in the target, interpreted by the target's <code class="r">kind</code> (an Entra UPN/email, a SQL Server login, a custom-script argument). No type/kind discriminator; carried verbatim to the daemon, never parsed server-side.</div></div>
-            <div class="f"><div class="k">terminate_sessions</div><div class="v">Whether to request session termination after rotation. Validated <b>at config time</b>: only allowed if the target is automatic and <code class="r">supports_session_termination</code> (so "requested-but-unsupported" is impossible).</div></div>
+            <div class="f"><div class="k">account_identity</div><div class="v">Opaque <code class="r">String</code> — the account's identifier in the target, interpreted by the target's <code class="r">kind</code> (an Entra UPN/email, a SQL Server login, a custom-script argument). No type/kind discriminator; carried verbatim to the daemon, never parsed server-side. Correctable after creation (<code class="r trig">UpdateRotationAccount</code>), but blocked while a job is active — the claim snapshot already carried the old identity.</div></div>
+            <div class="f"><div class="k">terminate_sessions</div><div class="v">Whether to request session termination after rotation. Validated <b>at config time</b>: only allowed if the target is automatic and <code class="r">supports_session_termination</code> (so "requested-but-unsupported" is impossible). Correctable via <code class="r trig">UpdateRotationAccount</code>, same guard.</div></div>
             <div class="f"><div class="k">schedule</div><div class="v"><code class="r">Schedule?</code> — the optional cron schedule trigger, inlined onto the config (no separate <code class="r">RotationSettings</code> value). Absent ⇒ no scheduled rotation.</div></div>
             <div class="f"><div class="k">rotate_on_access_end</div><div class="v"><code class="r">Boolean</code> — the access-event opt-in, inlined onto the config. Per credential; last write wins.</div></div>
             <div class="f"><div class="k">next_rotation_at</div><div class="v">Next scheduled rotation; absent ⇒ <code class="r trig">RotationDue</code> never fires.</div></div>
-            <div class="f"><div class="k">enabled</div><div class="v">Pause/resume without losing config.</div></div>
+            <div class="f"><div class="k">enabled</div><div class="v">Pause/resume without losing config. §6.8 <b>auto-pause</b> also clears it (the config, never the target) after <code class="r">max_consecutive_failures</code> terminal failures; the admin's <code class="r trig">ResumeRotation</code> is the recovery path.</div></div>
             <div class="f"><div class="k">last_rotation_at</div><div class="v">When it last rotated (auto or manual record).</div></div>
+            <div class="f"><div class="k">consecutive_failures</div><div class="v"><code class="r">Integer</code> — §6.8 failure tracking: consecutive terminal failures (a failed or timed-out job) since the last success or recorded manual rotation. Incremented by <code class="r trig">FailJob</code>/<code class="r trig">JobTimesOut</code>, reset by <code class="r trig">MarkJobSucceeded</code>/<code class="r trig">RecordManualRotation</code>; at <code class="r">max_consecutive_failures</code> (3) the config auto-pauses.</div></div>
+            <div class="f"><div class="k">pending_access_end</div><div class="v"><code class="r">Boolean</code> — the dropped-trigger latch: an access-end arriving while the config cannot be offered (paused, or target disabled) is latched here (audited <code class="r">access_end_deferred</code>), never dropped, and discharged on <code class="r trig">ResumeRotation</code>/<code class="r trig">EnableTargetSystem</code>.</div></div>
+            <div class="f"><div class="k">manual_obligation_alerted</div><div class="v"><code class="r">Boolean</code> — re-fire brake for the overdue-manual-obligation alert; reset when the obligation is cleared or a fresh one is raised.</div></div>
             <div class="f"><div class="k">derived</div><div class="v"><code class="r">has_active_job</code>, <code class="r">awaiting_manual_rotation</code> (a manual config that has come due).</div></div>
           </div>
         </div>
@@ -463,15 +474,19 @@ flowchart LR
         <div class="head"><span class="name">RotationJob</span><span class="tag owner-srv">server</span><span class="tag">entity</span></div>
         <div class="body">
           <div class="desc">One rotation occurrence, from "available" through a daemon claiming and executing it. <b>The job
-            is the cipher-write capability</b> and the recovery/timeout unit. There is no "lost" state.</div>
+            is the cipher-write capability</b> and the recovery/timeout unit. There is no "lost" state. A claim is a
+            <b>time-bounded lease</b>: the daemon may act on the target only until <code class="r">execute_by</code>, and a released
+            job never re-opens before that window elapses.</div>
           <div class="fields">
             <div class="f"><div class="k">rotation_config</div><div class="v">The config it rotates.</div></div>
             <div class="f"><div class="k">source</div><div class="v"><span class="state">scheduled</span> / <span class="state">on_demand</span> / <span class="state">access_end</span> — why the rotation fired.</div></div>
             <div class="f"><div class="k">claimed_by</div><div class="v"><code class="r ent">DaemonRegistration?</code> — the daemon currently handling it; null while pending; cleared on retry/release. Recovery is scoped by it.</div></div>
+            <div class="f"><div class="k">claimed_at</div><div class="v"><code class="r">Timestamp?</code> — when the current claim was taken (stamped by <code class="r trig">ClaimRotation</code>, cleared with <code class="r">claimed_by</code>). Present only while claimed: it starts the claim <b>lease</b>.</div></div>
             <div class="f"><div class="k">status</div><div class="v"><span class="state mid">pending</span> / <span class="state mid">claimed</span> / <span class="state go term">succeeded</span> / <span class="state bad term">failed</span> / <span class="state bad term">timed_out</span>. An explicit machine — <b>not</b> derived.</div></div>
-            <div class="f"><div class="k">next_claimable_at</div><div class="v">When it (re)becomes claimable; pushed out by a backoff after a failed attempt.</div></div>
+            <div class="f"><div class="k">next_claimable_at</div><div class="v">When it (re)becomes claimable; pushed out by a backoff after a failed attempt, and out to the dropped claim's lease expiry (<code class="r">execute_by</code>) on a release.</div></div>
             <div class="f"><div class="k">expires_at</div><div class="v"><code class="r">created_at + config.job_ttl</code> — past this it is timed out (renamed from <code class="r">deadline</code>).</div></div>
-            <div class="f"><div class="k">is_claimable</div><div class="v"><code class="r">pending and next_claimable_at &lt;= now</code>.</div></div>
+            <div class="f"><div class="k">execute_by (derived)</div><div class="v"><code class="r">claimed_at + config.release_delay</code> — the claim <b>lease deadline</b>: the latest instant the claiming daemon may still act on the target. Carried to the daemon on the claim snapshot; <code class="r trig">ReleaseJob</code> re-opens the job no earlier than this.</div></div>
+            <div class="f"><div class="k">is_claimable</div><div class="v"><code class="r">pending and next_claimable_at &lt;= now</code> <b>and</b> the config enabled <b>and</b> its target active — pausing a config or disabling its target holds a pending job un-claimable (it waits, and times out unless re-enabled first).</div></div>
             <div class="f"><div class="k">attempts (derived)</div><div class="v"><code class="r ent">RotationAttempt</code>s with <code class="r">job = this</code>. The retry budget is now derived from these, not a manual counter.</div></div>
             <div class="f"><div class="k">failed_attempts (derived)</div><div class="v"><code class="r">attempts where status = errored</code> — only <b>errored</b> attempts; an <span class="state">abandoned</span> one (daemon drop / timeout) is not charged.</div></div>
             <div class="f"><div class="k">attempt_count (derived)</div><div class="v"><code class="r">attempts.count</code> — for display.</div></div>
@@ -490,13 +505,16 @@ flowchart LR
           <div class="fields">
             <div class="f"><div class="k">job</div><div class="v"><code class="r ent">RotationJob</code> — direct link (and through it, the config and cipher).</div></div>
             <div class="f"><div class="k">claimed_by</div><div class="v"><code class="r ent">DaemonRegistration</code> — the daemon executing this attempt (only it may report).</div></div>
+            <div class="f"><div class="k">cipher_updated</div><div class="v"><code class="r">Boolean</code> — whether the server accepted a cipher write for this attempt (set by <code class="r trig">AcceptCipherUpdate</code>). <b>Server-side enforcement</b> of <code class="r sur">VerifiedBeforeSuccess</code>: <code class="r trig">RecordRotationSucceeded</code> refuses a success report for an attempt that never wrote the vault, so a buggy daemon cannot leave a succeeded job over a stale cipher.</div></div>
             <div class="f"><div class="k">status</div><div class="v"><span class="state mid">executing</span> / <span class="state go term">rotated</span> / <span class="state bad term">errored</span> / <span class="state term">abandoned</span>. Literals are deliberately disjoint from <code class="r ent">RotationJob</code>'s.</div></div>
             <div class="f"><div class="k">failure_reason</div><div class="v"><code class="r">String?</code> — present only when <span class="state bad">errored</span>.</div></div>
             <div class="f"><div class="k">sync_state</div><div class="v"><code class="r">FailureSyncState</code> — present only when <span class="state bad">errored</span>; where the failure left the vault relative to the target: <span class="state">target_unchanged</span> (the target was not modified; the stored cipher still matches it), <span class="state mid">target_updated</span> (the target was changed but the cipher was not — the stored credential is stale until a later attempt converges), or <span class="state">indeterminate</span> (the daemon cannot tell whether the change applied, e.g. a timeout after submission). An <span class="state">abandoned</span> attempt reports nothing, so its sync state is unknown by construction.</div></div>
             <div class="f"><div class="k">session_termination</div><div class="v"><code class="r">SessionTerminationOutcome</code> — present only when <span class="state go">rotated</span>; the best-effort outcome the daemon reported with success.</div></div>
           </div>
           <div class="desc" style="margin-top:12px"><b>States:</b> <span class="state go">rotated</span>/<span class="state bad">errored</span> (not succeeded/failed); only <span class="state bad">errored</span> spends the retry budget.
-            <span class="state">abandoned</span> = a daemon drop or timeout mid-attempt, <b>not</b> charged to the budget.</div>
+            <span class="state">abandoned</span> = a daemon drop or timeout mid-attempt, <b>not</b> charged to the budget.
+            A report for an already-resolved attempt, from a non-claimant, or a success with no accepted cipher write is refused <i>and audited</i>
+            (<code class="r trig">RejectStaleSuccessReport</code> / <code class="r trig">RejectStaleFailureReport</code>: <code class="r">report_rejected</code>).</div>
         </div>
       </div>
 
@@ -504,7 +522,7 @@ flowchart LR
         <div class="entity">
           <div class="head"><span class="name">DaemonRegistration</span><span class="tag owner-srv">server</span></div>
           <div class="body">
-            <div class="desc">A registered daemon identity. Server issues the credential out of band as one token string; it retains the <code class="r">client_id</code> (plus a secret hash) and the org key wrapped under the daemon's <code class="r">encryption_key</code> — never the key itself.</div>
+            <div class="desc">A registered daemon identity. Server issues the credential out of band as one token string; it retains the <code class="r">client_id</code> (plus a secret hash) and the org key wrapped under the daemon's <code class="r">encryption_key</code> — never the key itself. A compromised credential is rotated <i>in place</i> via <code class="r trig">ReissueDaemonCredential</code> (fresh secret + key, org key re-wrapped, live session invalidated, token shown once) — identity, assignments and audit continuity survive. <code class="r trig">RevokeDaemon</code> stays permanent decommission.</div>
             <div class="fields">
               <div class="f"><div class="k">name / client_id</div><div class="v">Identity.</div></div>
               <div class="f"><div class="k">status</div><div class="v"><span class="state go">enrolled</span> / <span class="state bad term">revoked</span>.</div></div>
@@ -553,7 +571,7 @@ flowchart LR
         <p style="margin:6px 0 0">The daemon holds <b>no <code class="r ent">RotationAttempt</code></b> and <b>no session-termination entity</b> of its own — both are
         server-side now (the attempt is the server's <code class="r ent">RotationAttempt</code>; session termination is folded into it). The daemon works entirely from the
         self-contained <code class="r trig">RotationClaimed</code> work snapshot (<code class="r">attempt_id</code>, target details, password policy, cipher,
-        account identity, terminate flag) and reports the outcome back by <code class="r">attempt_id</code> — a success via
+        account identity, terminate flag, and the claim's <code class="r">execute_by</code> lease deadline) and reports the outcome back by <code class="r">attempt_id</code> — a success via
         <code class="r trig">RotationSucceeded(attempt_id, session_termination)</code>, a failure via
         <code class="r trig">RotationAttemptFailed(attempt_id, reason, sync_state)</code>, relayed to the server as
         <code class="r trig">ReportRotationFailed(reporter, attempt_id, failure_reason, sync_state)</code>.</p>
@@ -563,20 +581,20 @@ flowchart LR
         <div class="entity">
           <div class="head"><span class="name">ServerConnection</span><span class="tag owner-dmn">daemon</span></div>
           <div class="body">
-            <div class="desc">The transport link only (WebSocket-like). SignalR/WebSockets owns socket, keep-alive, reconnect and backoff; the spec models only the outline.</div>
+            <div class="desc">The transport link only (WebSocket-like), created by process start (<code class="r trig">DaemonStarts</code> — one live transport at a time). SignalR/WebSockets owns socket, keep-alive, reconnect and backoff; the spec models only the outline. The server's <code class="r trig">DaemonConnected</code>/<code class="r trig">DaemonDisconnected</code> edges map to <b>this transport only</b>, never to session state.</div>
             <div class="fields">
-              <div class="f"><div class="k">status</div><div class="v"><span class="state mid">connecting</span> / <span class="state go">connected</span> / <span class="state mid">disconnected</span> / <span class="state bad term">refused</span> — <b>refused is terminal</b> (bad credential ⇒ no reconnect).</div></div>
+              <div class="f"><div class="k">status</div><div class="v"><span class="state mid">connecting</span> / <span class="state go">connected</span> / <span class="state mid">disconnected</span> / <span class="state bad term">refused</span> — <b>refused is terminal</b> (bad credential ⇒ no reconnect), reachable from <i>either</i> connecting or connected (a rejected mid-connection token refresh refuses a live link too). Recovery = operator restart with a reissued credential.</div></div>
             </div>
           </div>
         </div>
         <div class="entity">
           <div class="head"><span class="name">DaemonSession</span><span class="tag owner-dmn">daemon</span></div>
           <div class="body">
-            <div class="desc">The authenticated session riding on a connection: holds the short-lived access token and decrypted org key.</div>
+            <div class="desc">The authenticated session riding on a connection: holds the short-lived access token and decrypted org key. A session never outlives its transport: a drop closes it (<code class="r trig">ConnectionDropClosesSessions</code>) and the reconnected transport authenticates a <i>fresh</i> one — upholding <code class="r">AtMostOneActiveSession</code> across reconnects.</div>
             <div class="fields">
               <div class="f"><div class="k">connection / credential</div><div class="v">Which link and credential.</div></div>
-              <div class="f"><div class="k">status</div><div class="v"><span class="state mid">authenticating</span> / <span class="state go">active</span> / <span class="state mid">expired</span> / <span class="state bad term">revoked</span>.</div></div>
-              <div class="f"><div class="k">access_token / expires_at / organization_key</div><div class="v">Present only when <span class="state go">active</span>.</div></div>
+              <div class="f"><div class="k">status</div><div class="v"><span class="state mid">authenticating</span> / <span class="state go">active</span> / <span class="state mid">expired</span> / <span class="state bad term">revoked</span> / <span class="state term">closed</span> — <b>closed</b> (transport dropped) is terminal like revoked, but the credential is still good; a dropped session is never resumed.</div></div>
+              <div class="f"><div class="k">access_token / expires_at / organization_key</div><div class="v">Present only when <span class="state go">active</span>; cleared on <i>every</i> exit from active.</div></div>
             </div>
           </div>
         </div>
@@ -622,10 +640,10 @@ flowchart LR
         <div class="mermaid">
 stateDiagram-v2
   [*] --> pending: OfferRotation (rotation becomes due)
-  pending --> claimed: ClaimRotation (eligible daemon claims, attempt created: executing)
+  pending --> claimed: ClaimRotation (eligible daemon claims, claimed_at stamped, attempt created: executing)
   claimed --> succeeded: MarkJobSucceeded (attempt rotated)
-  claimed --> pending: RetryJob (attempt errored, budget left, backoff)
-  claimed --> pending: ReleaseJob (claiming daemon dropped, attempt abandoned)
+  claimed --> pending: RetryJob (attempt errored, budget left, retry_base_delay backoff)
+  claimed --> pending: ReleaseJob (claiming daemon dropped, attempt abandoned, re-claimable at execute_by)
   claimed --> failed: FailJob (errored attempts exhausted, max_attempts)
   pending --> timed_out: JobTimesOut (expires_at, never claimed)
   claimed --> timed_out: JobTimesOut (expires_at, stuck daemon, attempt abandoned)
@@ -637,9 +655,11 @@ stateDiagram-v2
     claimed to pending. Both a
     retry and a daemon-drop
     release take it. No "lost" state.
+    A release respects the dropped
+    claim's lease (execute_by).
   end note
         </div>
-        <div class="cap">Terminal: <span class="state go term">succeeded</span> <span class="state bad term">failed</span> <span class="state bad term">timed_out</span>. <code class="r trig">JobTimesOut</code> is the backstop that fences off late results from abandoned attempts.</div>
+        <div class="cap">Terminal: <span class="state go term">succeeded</span> <span class="state bad term">failed</span> <span class="state bad term">timed_out</span>. The claim is a <b>lease</b>: <code class="r trig">ClaimRotation</code> stamps <code class="r">claimed_at</code>, and a released job re-opens only at <code class="r">execute_by</code> (<code class="r">claimed_at + release_delay</code>, 15&nbsp;min) so a partitioned daemon is fenced out of the target first. <code class="r trig">JobTimesOut</code> is the backstop that fences off late results from abandoned attempts — but it never times out a job whose attempt already <span class="state go">rotated</span> (success wins; the same guard holds for <code class="r trig">ReleaseJob</code>). Pausing the config or disabling the target holds a <span class="state mid">pending</span> job un-claimable (<code class="r">is_claimable</code>).</div>
       </div>
 
       <h3>RotationAttempt — one try, server-owned</h3>
@@ -660,7 +680,7 @@ stateDiagram-v2
     the retry budget; abandoned does not.
   end note
         </div>
-        <div class="cap">Created by the server on claim and transitioned on the daemon's reported outcome. <span class="state go term">rotated</span>/<span class="state bad term">errored</span> (not succeeded/failed); <span class="state term">abandoned</span> on a daemon drop or timeout, never charged to the budget. The attempt's transition drives <code class="r trig">MarkJobSucceeded</code>/<code class="r trig">RetryJob</code>/<code class="r trig">FailJob</code>.</div>
+        <div class="cap">Created by the server on claim and transitioned on the daemon's reported outcome. <span class="state go term">rotated</span>/<span class="state bad term">errored</span> (not succeeded/failed); <span class="state term">abandoned</span> on a daemon drop or timeout, never charged to the budget. The attempt's transition drives <code class="r trig">MarkJobSucceeded</code>/<code class="r trig">RetryJob</code>/<code class="r trig">FailJob</code>. <code class="r trig">RecordRotationSucceeded</code> additionally requires <code class="r">cipher_updated</code> (an accepted cipher write); a stale, mis-owned or write-less report is refused and audited <code class="r">report_rejected</code>.</div>
       </div>
 
       <div class="grid2">
@@ -669,20 +689,23 @@ stateDiagram-v2
           <div class="diagram">
             <div class="mermaid">
 stateDiagram-v2
-  [*] --> connecting: link comes up
+  [*] --> connecting: DaemonStarts (process start creates the transport)
   connecting --> connected: OpenConnection (auth ok)
   connecting --> refused: RefuseConnection (auth rejected)
+  connected --> refused: RefuseConnection (mid-connection refresh rejected)
   connected --> disconnected: ServerInterruptsConnection
   disconnected --> connecting: Reconnect (backoff, SignalR)
-  connected --> [*]
   refused --> [*]
   note right of refused
     Terminal. Bad/revoked
     credential, daemon does
-    NOT reconnect.
+    NOT reconnect. Recovery is
+    a restart with a reissued
+    credential (DaemonStarts
+    permits it after a refusal).
   end note
             </div>
-            <div class="cap">Transient drop loops back via <code class="r trig">Reconnect</code>; auth rejection is terminal.</div>
+            <div class="cap">Transient drop loops back via <code class="r trig">Reconnect</code>; auth rejection is terminal <b>from either state</b> — a rejected mid-connection token refresh refuses a live link too. A drop also closes the riding session (<code class="r trig">ConnectionDropClosesSessions</code>).</div>
           </div>
         </div>
         <div>
@@ -696,14 +719,20 @@ stateDiagram-v2
   active --> expired: SessionExpires (token lapses)
   active --> revoked: HandleSessionRevoked (admin revoke)
   expired --> authenticating: RefreshSession
-  active --> [*]
+  authenticating --> closed: CloseIdleSession (transport dropped)
+  active --> closed: CloseActiveSession (transport dropped)
+  expired --> closed: CloseIdleSession (transport dropped)
   revoked --> [*]
+  closed --> [*]
   note right of revoked
-    Terminal. Needs a new
-    credential to recover.
+    Both terminal. revoked needs a
+    new credential; closed means the
+    transport dropped - the credential
+    is still good and the reconnected
+    transport gets a FRESH session.
   end note
             </div>
-            <div class="cap">One active session per connection (<code class="r">AtMostOneActiveSession</code>); token refreshes independently of the link.</div>
+            <div class="cap">One active session per connection (<code class="r">AtMostOneActiveSession</code> — upheld across reconnects by closing the dropped transport's session, <code class="r trig">ConnectionDropClosesSessions</code>); token refreshes independently of the link, and <code class="r trig">HandleAuthenticationSucceeded</code> completes a <b>mid-connection refresh</b> too (the connection-status guard no longer excludes it). The when-gated token fields are cleared on every exit from <span class="state go">active</span>.</div>
           </div>
         </div>
       </div>
@@ -726,14 +755,16 @@ stateDiagram-v2
 stateDiagram-v2
   [*] --> active: Register(Automatic|Manual)TargetSystem
   active --> disabled: DisableTargetSystem
-  disabled --> active: EnableTargetSystem
+  disabled --> active: EnableTargetSystem (schedules recomputed, deferred access-ends discharged)
   note right of disabled
     Stops NEW rotations being
-    offered; claimed jobs
-    unaffected.
+    offered and holds pending
+    jobs un-claimable; claimed
+    jobs unaffected (never
+    cancelled).
   end note
             </div>
-            <div class="cap">No terminal state — a target toggles freely. Method is fixed at creation (see open questions).</div>
+            <div class="cap">No terminal state — a target toggles freely. Re-enabling catches up: schedules are recomputed from now (missed windows deliberately skipped, mirroring resume) and any deferred access-end is discharged. Name, password policy and termination capability are editable (<code class="r trig">RenameTargetSystem</code>, <code class="r trig">UpdateTargetSystemPolicy</code>); kind and method are fixed at creation (see open questions).</div>
           </div>
         </div>
       </div>
@@ -744,15 +775,19 @@ stateDiagram-v2
           <div class="mermaid">
 stateDiagram-v2
   [*] --> enrolled: RegisterDaemon (credential issued out of band)
+  enrolled --> enrolled: ReissueDaemonCredential (fresh secret + key, session invalidated)
   enrolled --> revoked: RevokeDaemon
   revoked --> [*]
   note right of enrolled
     Registration also creates a
     DaemonConnection (disconnected)
     via InitDaemonConnection.
+    Reissue rotates the credential
+    in place - identity and
+    assignments survive.
   end note
           </div>
-          <div class="cap">DaemonRegistration — terminal at <span class="state bad term">revoked</span>.</div>
+          <div class="cap">DaemonRegistration — terminal at <span class="state bad term">revoked</span> (permanent decommission; recovery is a <i>new</i> registration, by design). A compromised credential is instead rotated in place by <code class="r trig">ReissueDaemonCredential</code>, audited <code class="r">daemon_credential_reissued</code>. Revoking is also the effective <b>in-flight brake</b>: it closes the transport, and the daemon aborts at its next step boundary.</div>
         </div>
         <div class="diagram">
           <div class="mermaid">
@@ -766,7 +801,7 @@ stateDiagram-v2
     DaemonConnectionDropsReleaseJobs.
   end note
           </div>
-          <div class="cap">DaemonConnection — toggles with liveness; one per daemon.</div>
+          <div class="cap">DaemonConnection — toggles with liveness; one per daemon. The edges are <b>transport-only</b>: a session expiry with the transport up is <i>not</i> a disconnect (it would release a healthy daemon's job mid-refresh; <code class="r trig">ClaimRotation</code> re-validates the token per claim anyway). A rejected refresh or a revocation closes the transport, and <i>that</i> raises disconnected.</div>
         </div>
       </div>
     </section>
@@ -786,24 +821,25 @@ flowchart TD
   T1 --> OF["OfferRotation<br/>(enabled, automatic, active, no active job)"]
   T2 --> OF
   T3 --> OF
-  OF --> JOB["RotationJob created: pending, audit: offered<br/>server push-notifies eligible daemons"]
-  JOB --> CL["ClaimRotation<br/>(connected, assigned, token re-validated)<br/>then claimed; server creates RotationAttempt: executing"]
-  CL --> RClaimed["RotationClaimed (work snapshot, attempt_id) + audit: dispatched"]
-  RClaimed --> SR["StartRotation then ExecuteRotation<br/>(daemon executes from the snapshot, no local attempt entity)"]
+  OF --> JOB["RotationJob created: pending, audit: offered<br/>server push-notifies eligible daemons (NotifyEligibleDaemons;<br/>re-announced on reconnect and on a late assignment)"]
+  JOB --> CL["ClaimRotation<br/>(connected, assigned, token re-validated, config live)<br/>then claimed, claimed_at stamped (the lease starts);<br/>server creates RotationAttempt: executing"]
+  CL --> RClaimed["RotationClaimed (work snapshot: attempt_id, execute_by, ...) + audit: dispatched"]
+  RClaimed --> SR["StartRotation then ExecuteRotation<br/>(daemon executes from the snapshot, no local attempt entity;<br/>no active session at this point = fail fast, target_unchanged)"]
   SR --> OUT{outcome reported by attempt_id}
-  OUT -->|ReportRotationSucceeded| ROT["RecordRotationSucceeded<br/>attempt: executing then rotated"]
+  OUT -->|ReportRotationSucceeded| ROT["RecordRotationSucceeded<br/>(requires cipher_updated)<br/>attempt: executing then rotated"]
   OUT -->|ReportRotationFailed| ERR["RecordRotationFailed<br/>attempt: executing then errored (reason + sync_state)"]
-  ROT --> OK["MarkJobSucceeded<br/>job succeeded, reschedule, audit: succeeded"]
+  ROT --> OK["MarkJobSucceeded<br/>job succeeded, reschedule, consecutive_failures = 0, audit: succeeded"]
   ERR --> FAIL{has_retry_budget?}
   FAIL -->|yes| RJ["RetryJob then pending (backoff), audit: attempt_failed"]
-  FAIL -->|no| FJ["FailJob then failed, RotationFailed, audit: failed"]
+  FAIL -->|no| FJ["FailJob then failed, consecutive_failures + 1,<br/>RotationFailed, audit: failed"]
   RJ --> CL
+  FJ --> AL["§6.8 chain: AlertOnRotationFailed raises OperatorAlertRaised<br/>(elevated if sync_state target_updated or source access_end);<br/>at 3 consecutive failures AutoPauseAfterConsecutiveFailures<br/>pauses the CONFIG, audit: auto_paused"]
   classDef ok fill:#13241f,stroke:#2d5b3f,color:#bdf0e6;
   classDef bad fill:#241313,stroke:#5b2d2d,color:#f0bdbd;
   class OK ok;
-  class FJ bad;
+  class FJ,AL bad;
         </div>
-        <div class="cap">All three triggers converge on <code class="r trig">OfferRotation</code>, the single place a job is created.</div>
+        <div class="cap">All three triggers converge on <code class="r trig">OfferRotation</code>, the single place a job is created — an access-end that <i>cannot</i> be offered right now (config paused / target disabled) is latched on <code class="r">pending_access_end</code> instead of dropped (§6). Daemon-side, the announcement is consumed by <code class="r trig">ClaimAvailableRotation</code>, which claims only while holding an active session.</div>
       </div>
 
       <h3>(b) Claim hand-off + cipher write-back authorisation</h3>
@@ -815,9 +851,9 @@ sequenceDiagram
   participant T as Target system
   participant V as Vault (Cipher)
   D->>S: ClaimRotation(job), re-validate OAuth token
-  Note over S: job to claimed, claimed_by = D<br/>server creates RotationAttempt (executing), audit: dispatched
-  S-->>D: RotationClaimed (attempt_id, id, name, kind, policy, cipher, account, ...)
-  Note over D: StartRotation then ExecuteRotation<br/>(executes from snapshot, no local attempt entity)
+  Note over S: job to claimed, claimed_by = D, claimed_at = now<br/>(the lease: execute_by = claimed_at + release_delay)<br/>server creates RotationAttempt (executing, cipher_updated false), audit: dispatched
+  S-->>D: RotationClaimed (attempt_id, id, name, kind, policy, cipher, account, execute_by, ...)
+  Note over D: StartRotation then ExecuteRotation<br/>(executes from snapshot, no local attempt entity —<br/>no target-side step is initiated past session loss or execute_by)
   D->>D: resolve connection details via CredentialResolver(target_system_id)<br/>(env-first, SM / local config opt-in)
   D->>D: generate password per policy
   D->>T: run kind integration, set new password
@@ -825,16 +861,20 @@ sequenceDiagram
   D->>V: GET cipher (only this one, no broader read scope)
   D->>S: SubmitCipherUpdate(writer=D, attempt by attempt_id, new_password)
   alt server-local attempt executing + job claimed by this daemon
-    Note over S: AcceptCipherUpdate<br/>cipher.password = ciphertext (stored as-is)
+    Note over S: AcceptCipherUpdate<br/>cipher.password = ciphertext (stored as-is)<br/>attempt.cipher_updated = true
     S-->>D: accepted
   else no claimed job / different owner / attempt resolved
     Note over S: RejectCipherUpdate, audit: write_rejected
     S-->>D: rejected, then ReportRotationFailed
   end
+  D->>S: ReportRotationSucceeded(attempt_id, session_termination)
+  Note over S: RecordRotationSucceeded requires cipher_updated —<br/>a success report with no accepted write is refused,<br/>audit: report_rejected
         </div>
         <div class="cap">No separate write token. The daemon's own claimed job (<code class="r">claimed_by</code> + <code class="r">claimed</code> status) is the capability;
         the write targets the attempt's cipher only, and the server stores ciphertext without decrypting it. The write happens only after the rotated
-        credential is verified against the target — success is reported only once both have passed (guarantee <code class="r sur">VerifiedBeforeSuccess</code>).</div>
+        credential is verified against the target — success is reported only once both have passed (guarantee <code class="r sur">VerifiedBeforeSuccess</code>),
+        and the server independently enforces the write half: <code class="r trig">RecordRotationSucceeded</code> accepts a success report only for an attempt whose
+        <code class="r">cipher_updated</code> was set by <code class="r trig">AcceptCipherUpdate</code>.</div>
       </div>
 
       <h3>(c) Recovery paths — retry, daemon-drop release, timeout</h3>
@@ -842,21 +882,26 @@ sequenceDiagram
         <div class="mermaid">
 flowchart TD
   C["RotationJob: claimed<br/>(in-flight attempt: executing)"] --> E{what happens?}
-  E -->|attempt errored, budget left| R1["RecordRotationFailed (attempt errored)<br/>then RetryJob to pending after backoff"]
-  E -->|attempt errored, budget gone| R2["RecordRotationFailed (attempt errored)<br/>then FailJob to failed, RotationFailed emitted"]
-  E -->|claiming daemon drops| R3["DaemonConnectionDropsReleaseJobs then ReleaseJob<br/>in-flight attempt marked abandoned (AbandonAttempt)<br/>job to pending (not charged to budget)"]
-  E -->|deadline passes| R4["JobTimesOut to timed_out<br/>in-flight attempt marked abandoned<br/>RotationFailed emitted"]
+  E -->|attempt errored, budget left| R1["RecordRotationFailed (attempt errored)<br/>then RetryJob to pending after retry_base_delay backoff"]
+  E -->|attempt errored, budget gone| R2["RecordRotationFailed (attempt errored)<br/>then FailJob to failed, consecutive_failures + 1<br/>RotationFailed (alert_kind job_failed) emitted"]
+  E -->|claiming daemon drops| R3["DaemonConnectionDropsReleaseJobs then ReleaseJob<br/>in-flight attempt marked abandoned (AbandonAttempt)<br/>job to pending, but re-claimable only at execute_by —<br/>the dropped claim's lease (not charged to budget)"]
+  E -->|deadline passes| R4["JobTimesOut to timed_out (unless an attempt<br/>already rotated — success wins)<br/>in-flight attempt marked abandoned, consecutive_failures + 1<br/>RotationFailed emitted (job_unroutable if never claimed,<br/>job_stuck if a claiming daemon wedged)"]
   R1 --> P["pending, re-claimable by any<br/>eligible daemon (same or another)<br/>a fresh claim makes a fresh attempt"]
   R3 --> P
   P --> C
+  R2 --> S68["§6.8: OperatorAlertRaised via AlertOnRotationFailed;<br/>at max_consecutive_failures (3) the config auto-pauses"]
+  R4 --> S68
   classDef bad fill:#241313,stroke:#5b2d2d,color:#f0bdbd;
-  class R2,R4 bad;
+  class R2,R4,S68 bad;
         </div>
         <div class="cap">Only an <span class="state bad">errored</span> attempt spends a retry-budget unit (<code class="r">failed_attempts</code> counts <code class="r">status = errored</code> only).
         A connectivity drop (<code class="r trig">ReleaseJob</code>) or a mid-attempt timeout (<code class="r trig">JobTimesOut</code>) marks the in-flight attempt
-        <span class="state">abandoned</span> via <code class="r trig">AbandonAttempt</code>, which is never charged. <code class="r trig">JobTimesOut</code> backstops anything that never resolves.
+        <span class="state">abandoned</span> via <code class="r trig">AbandonAttempt</code>, which is never charged — but a released job is held un-claimable until the dropped
+        claim's <code class="r">execute_by</code> lease elapses (<code class="r">release_delay</code>, 15&nbsp;min — <i>not</i> the 1-second <code class="r">retry_base_delay</code>), while
+        daemon-side the partitioned daemon aborts at its next step boundary (<code class="r sur">NoTargetActionPastSessionLoss</code>) — together closing the claim-release race
+        at the target system. <code class="r trig">JobTimesOut</code> backstops anything that never resolves.
         A genuine failure's report also carries the vault↔target <code class="r">sync_state</code> it left behind, recorded on the errored attempt;
-        an abandoned attempt reports nothing, so its sync state is unknown by construction.</div>
+        an abandoned attempt reports nothing, so its sync state is unknown by construction. Terminal failures and timeouts feed the §6.8 alert and auto-pause chain.</div>
       </div>
 
       <h3>(d) Connection + authentication lifecycle</h3>
@@ -865,7 +910,8 @@ flowchart TD
 sequenceDiagram
   participant D as Daemon
   participant S as Server
-  D->>S: connecting, DaemonConnects, DaemonSession(authenticating)
+  Note over D: DaemonStarts creates the transport (connecting)
+  D->>S: DaemonConnects, DaemonSession(authenticating)
   D->>S: present credential (client_id + client_secret)
   alt credential valid
     S-->>D: AuthenticationSucceeded(access_token, expires_at, org_key encrypted)
@@ -873,14 +919,16 @@ sequenceDiagram
     Note over D: OpenConnection, connected, pull work
   else credential bad / revoked
     S-->>D: AuthenticationRejected
-    Note over D: session to revoked, ConnectionRefused<br/>RefuseConnection, refused (TERMINAL, no reconnect)
+    Note over D: session to revoked, ConnectionRefused<br/>RefuseConnection, refused (TERMINAL, no reconnect —<br/>recovery: ReissueDaemonCredential + restart)
   end
   Note over D,S: while live...
   S-->>D: ConnectionInterrupted, disconnected, Reconnect (backoff)
-  Note over D: SessionExpires, expired, RefreshSession, re-authenticate
+  Note over D: ConnectionDropClosesSessions: the riding session is CLOSED (terminal) —<br/>the reconnected transport authenticates a fresh one
+  Note over D: SessionExpires, expired, RefreshSession, re-authenticate<br/>(a mid-connection refresh leaves the connected transport untouched)
   S-->>D: SessionRevoked (admin RevokeDaemon), session revoked
+  Note over D: a REJECTED mid-connection refresh refuses the live link too<br/>(HandleAuthenticationRejected, RefuseConnection from connected)
         </div>
-        <div class="cap">Transport (<code class="r ent">ServerConnection</code>) and session (<code class="r ent">DaemonSession</code>) are independent: the link can drop/reconnect many times while a token refreshes on its own schedule.</div>
+        <div class="cap">Transport (<code class="r ent">ServerConnection</code>) and session (<code class="r ent">DaemonSession</code>) are independent: the link can drop/reconnect many times while a token refreshes on its own schedule — but a session never outlives its transport (a drop closes it, and the fresh link gets a fresh session), and a rejected refresh terminally refuses the link from <span class="state go">connected</span>. Server-side, only the <b>transport</b> edges raise <code class="r trig">DaemonConnected</code>/<code class="r trig">DaemonDisconnected</code>.</div>
       </div>
 
       <h3>(e) Manual-rotation fallback</h3>
@@ -888,14 +936,19 @@ sequenceDiagram
         <div class="mermaid">
 flowchart TD
   M0["RotationConfig on a MANUAL target<br/>(method = manual)"] --> M1["schedule reached<br/>next_rotation_at &lt;= now"]
+  M0 --> M1b["access grant ended (opted in)<br/>RaiseManualObligationOnAccessEnd pulls the obligation due<br/>(next_rotation_at = now, audit: manual_rotation_due)"]
   M1 --> M2["awaiting_manual_rotation = true<br/>(obligation surfaced, NEVER offered as a job)"]
+  M1b --> M2
   M2 --> M3["Admin rotates the credential out of band"]
-  M3 --> M4["RecordManualRotation<br/>last_rotation_at = now, reschedule, audit: manual_recorded"]
+  M2 --> M5["unmet past manual_obligation_alert_after (24h):<br/>AlertManualObligationOverdue raises an ELEVATED<br/>OperatorAlertRaised (once, re-fire brake)"]
+  M3 --> M4["RecordManualRotation<br/>last_rotation_at = now, reschedule, audit: manual_recorded<br/>(resets consecutive_failures, the alert brake and any deferred access-end)"]
   M2 -. "ManualConfigNeverJobbed: a manual config is never dispatched" .- M2
   classDef note fill:#1c212b,stroke:#5b4a2d,color:#ffe2b0;
+  classDef bad fill:#241313,stroke:#5b2d2d,color:#f0bdbd;
   class M2 note;
+  class M5 bad;
         </div>
-        <div class="cap"><code class="r trig">RotationDue</code> requires <code class="r">method = automatic</code>, so a manual config never produces a job; its due-ness becomes an obligation an admin clears.</div>
+        <div class="cap"><code class="r trig">RotationDue</code> requires <code class="r">method = automatic</code>, so a manual config never produces a job; its due-ness becomes an obligation an admin clears. An access-end for an opted-in manual credential pulls the obligation due immediately (it is security-relevant, never silently dropped — a <i>paused</i> manual config latches it via <code class="r trig">DeferManualAccessEndWhilePaused</code> and it comes due on resume), and an obligation standing unmet past 24&nbsp;h raises an elevated operator alert.</div>
       </div>
     </section>
 
@@ -932,6 +985,20 @@ flowchart TD
           <code class="r">encryption_key</code> (never transmitted); the server stores only ciphertext
           (<code class="r sur">ServerZeroKnowledge</code>).</p>
         </div>
+        <div class="card">
+          <h4>Re-issue vs revoke</h4>
+          <p class="muted">A compromised credential is rotated <b>in place</b>: <code class="r trig">ReissueDaemonCredential</code> generates a fresh
+          <code class="r">client_secret</code> + <code class="r">encryption_key</code>, re-wraps the org key, invalidates the live session and shows the new
+          token once (out of band) — registration identity, assignments and audit continuity survive. <code class="r trig">RevokeDaemon</code> remains
+          permanent decommission (recovery = a new registration, by design) and doubles as the <b>in-flight brake</b> for a runaway daemon.</p>
+        </div>
+        <div class="card">
+          <h4>Transport-only liveness</h4>
+          <p class="muted"><code class="r trig">DaemonConnected</code>/<code class="r trig">DaemonDisconnected</code> map <b>exclusively</b> to the
+          authenticated transport coming up/down — never to session state. A token expiring while the socket stays up is <i>not</i> a disconnect
+          (that would release a healthy daemon's job mid-refresh); a rejected refresh or a revocation closes the transport, and <i>that</i> raises
+          disconnected.</p>
+        </div>
       </div>
       <div class="callout">
         <span class="lbl">Eligibility = the security boundary</span>
@@ -942,7 +1009,9 @@ flowchart TD
 
       <h3>Audit emission — every operation</h3>
       <p><b>Every operation the server performs is written to the audit log</b> — viewing the audit log is how an operator can
-      tell a credential was rotated. Two pure-sink events carry it (no rule chains off either); durable WORM storage is the
+      tell a credential was rotated. Three pure-sink events carry the cross-cutting record streams (no rule chains off any):
+      <code class="r trig">RotationAudited</code> and <code class="r trig">AdministrationAudited</code> for the audit log, and
+      <code class="r trig">OperatorAlertRaised</code> for §6.8 operator alerts (see the failure-policy topic below). Durable WORM storage is the
       existing Phase-1 audit log's job, out of scope here. <code class="r trig">RotationAudited</code> covers every configuration
       and rotation event:</p>
       <table>
@@ -950,34 +1019,45 @@ flowchart TD
         <tbody>
           <tr><td><code class="r">config_created</code></td><td>AuditRotationConfigCreated</td><td>A rotation configuration was created (a reaction rule on <code class="r">RotationConfig.created</code>).</td></tr>
           <tr><td><code class="r">settings_updated</code></td><td>UpdateRotationSettings</td><td>The credential's triggers/schedule were edited (carries <code class="r">actor</code>).</td></tr>
+          <tr><td><code class="r">account_updated</code></td><td>UpdateRotationAccount</td><td>The account identity / termination opt-in was corrected (carries <code class="r">actor</code>; blocked while a job is active).</td></tr>
+          <tr><td><code class="r">config_deleted</code></td><td>DeleteRotationConfig</td><td>The configuration was deleted — its jobs/attempts go with it, the audit history stays (carries <code class="r">actor</code>).</td></tr>
           <tr><td><code class="r">paused</code></td><td>PauseRotation</td><td>Rotation paused without losing configuration (carries <code class="r">actor</code>).</td></tr>
           <tr><td><code class="r">resumed</code></td><td>ResumeRotation</td><td>Rotation resumed, next occurrence recomputed (carries <code class="r">actor</code>).</td></tr>
+          <tr><td><code class="r">auto_paused</code></td><td>AutoPauseAfterConsecutiveFailures</td><td>The config auto-paused after <code class="r">max_consecutive_failures</code> consecutive terminal failures (§6.8, carries <code class="r">source</code>).</td></tr>
           <tr><td><code class="r">offered</code></td><td>OfferRotation</td><td>A due rotation became an available job (carries <code class="r">source</code>).</td></tr>
-          <tr><td><code class="r">dispatched</code></td><td>ClaimRotation</td><td>A daemon claimed the job (the attempt begins).</td></tr>
+          <tr><td><code class="r">dispatched</code></td><td>ClaimRotation</td><td>A daemon claimed the job (the attempt begins, the lease starts).</td></tr>
           <tr><td><code class="r">succeeded</code></td><td>MarkJobSucceeded</td><td>The attempt succeeded.</td></tr>
           <tr><td><code class="r">attempt_failed</code></td><td>RetryJob</td><td>An attempt failed but will be retried (carries <code class="r">reason</code> and <code class="r">sync_state</code>).</td></tr>
           <tr><td><code class="r">failed</code></td><td>FailJob</td><td>All attempts failed (carries <code class="r">reason</code> and <code class="r">sync_state</code>).</td></tr>
-          <tr><td><code class="r">released</code></td><td>ReleaseJob</td><td>A claim was released after a daemon drop.</td></tr>
-          <tr><td><code class="r">timed_out</code></td><td>JobTimesOut</td><td>Unresolved past the deadline (server-side reason).</td></tr>
-          <tr><td><code class="r">write_rejected</code></td><td>RejectCipherUpdate</td><td>A cipher write was refused.</td></tr>
+          <tr><td><code class="r">released</code></td><td>ReleaseJob</td><td>A claim was released after a daemon drop (re-claimable at the lease expiry).</td></tr>
+          <tr><td><code class="r">timed_out</code></td><td>JobTimesOut</td><td>Unresolved past the deadline (server-side reason: unroutable vs stuck daemon).</td></tr>
+          <tr><td><code class="r">write_rejected</code></td><td>RejectCipherUpdate</td><td>A cipher write was refused (the exact complement of <code class="r trig">AcceptCipherUpdate</code>).</td></tr>
+          <tr><td><code class="r">report_rejected</code></td><td>RejectStaleSuccessReport / RejectStaleFailureReport</td><td>A stale, mis-owned or write-less outcome report was refused.</td></tr>
+          <tr><td><code class="r">manual_rotation_due</code></td><td>RaiseManualObligationOnAccessEnd</td><td>An access-end pulled a manual config's obligation due (carries <code class="r">source</code>).</td></tr>
+          <tr><td><code class="r">access_end_deferred</code></td><td>DeferAccessEndWhileUnavailable / DeferManualAccessEndWhilePaused</td><td>An access-end arrived while the config could not act (paused / target disabled) — latched, never dropped (carries <code class="r">source</code>).</td></tr>
           <tr><td><code class="r">manual_recorded</code></td><td>RecordManualRotation</td><td>An admin recorded an out-of-band rotation (carries <code class="r">actor</code>).</td></tr>
         </tbody>
       </table>
-      <p><code class="r">source</code> (why the rotation fired) rides on every job-derived outcome; <code class="r">sync_state</code>
+      <p><code class="r">source</code> (why the rotation fired) rides on every job-derived outcome and on <code class="r">manual_rotation_due</code>,
+      <code class="r">access_end_deferred</code> and <code class="r">auto_paused</code>; <code class="r">sync_state</code>
       (<code class="r">FailureSyncState</code>) rides on <code class="r">attempt_failed</code> and <code class="r">failed</code> so the log records whether
       a failure left the stored cipher stale; <code class="r">actor</code> is the acting admin on <code class="r">manual_recorded</code>,
-      <code class="r">settings_updated</code>, <code class="r">paused</code> and <code class="r">resumed</code>. Each is absent where it does not apply.</p>
+      <code class="r">settings_updated</code>, <code class="r">account_updated</code>, <code class="r">config_deleted</code>,
+      <code class="r">paused</code> and <code class="r">resumed</code>. Each is absent where it does not apply.</p>
       <p>The new pure-sink <code class="r trig">AdministrationAudited</code> covers every administrative operation on the fleet and targets:</p>
       <table>
         <thead><tr><th>Operation</th><th>Emitted by</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td><code class="r">daemon_registered</code></td><td>RegisterDaemon</td><td>A daemon was registered (name + client_id; credential issued out of band).</td></tr>
-          <tr><td><code class="r">daemon_revoked</code></td><td>RevokeDaemon</td><td>A daemon's credential was revoked.</td></tr>
+          <tr><td><code class="r">daemon_revoked</code></td><td>RevokeDaemon</td><td>A daemon's credential was revoked (permanent decommission).</td></tr>
+          <tr><td><code class="r">daemon_credential_reissued</code></td><td>ReissueDaemonCredential</td><td>A daemon's credential was rotated in place — identity and assignments preserved, live session invalidated, token shown once.</td></tr>
           <tr><td><code class="r">daemon_assigned</code></td><td>AssignDaemonToTarget</td><td>A daemon was granted eligibility for a target.</td></tr>
           <tr><td><code class="r">daemon_unassigned</code></td><td>UnassignDaemonFromTarget</td><td>An assignment was removed.</td></tr>
           <tr><td><code class="r">target_registered</code></td><td>Register(Automatic|Manual)TargetSystem</td><td>A target system was registered.</td></tr>
-          <tr><td><code class="r">target_disabled</code></td><td>DisableTargetSystem</td><td>A target was disabled (new rotations stop being offered).</td></tr>
-          <tr><td><code class="r">target_enabled</code></td><td>EnableTargetSystem</td><td>A target was re-enabled.</td></tr>
+          <tr><td><code class="r">target_disabled</code></td><td>DisableTargetSystem</td><td>A target was disabled (new rotations stop being offered; pending jobs held un-claimable).</td></tr>
+          <tr><td><code class="r">target_enabled</code></td><td>EnableTargetSystem</td><td>A target was re-enabled (schedules recomputed, deferred access-ends discharged).</td></tr>
+          <tr><td><code class="r">target_renamed</code></td><td>RenameTargetSystem</td><td>A target's display name changed (the id, which keys the daemon's resolver, never does).</td></tr>
+          <tr><td><code class="r">target_policy_updated</code></td><td>UpdateTargetSystemPolicy</td><td>The password policy / session-termination capability was edited (kind is immutable; the capability is withdrawable only while unused).</td></tr>
         </tbody>
       </table>
       <div class="callout">
@@ -987,13 +1067,61 @@ flowchart TD
         a drop's impact on in-flight work is audited via the <code class="r">released</code> outcome.</p>
       </div>
 
+      <h3>In-flight safety — the claim lease and the step-boundary abort</h3>
+      <p>The claim-release race at the target system is closed by two halves, one per side of the boundary. The cipher write was
+      always fenced (<code class="r sur">JobBoundWrite</code>); these fence the <b>target system</b> too:</p>
+      <div class="grid2">
+        <div class="card">
+          <h4>Server half: the claim is a lease</h4>
+          <p class="muted"><code class="r trig">ClaimRotation</code> stamps <code class="r">claimed_at</code>; the derived
+          <code class="r">execute_by = claimed_at + release_delay</code> (15&nbsp;min, a dedicated recovery knob — placeholder tunable, sized
+          to a worst-case single attempt and deliberately distinct from the 1-second <code class="r">retry_base_delay</code>, which was the
+          bug for release) rides to the daemon on the claim snapshot. <code class="r trig">ReleaseJob</code> sets
+          <code class="r">next_claimable_at</code> to that lease expiry, so a dropped daemon's job <b>never re-opens while the dropped
+          daemon might still be inside its lease</b> acting on the target. Clock skew is absorbed by the sizing margin.
+          <code class="r trig">RetryJob</code> is unchanged: a genuine failure reported by a <i>live</i> daemon still spaces on
+          <code class="r">retry_base_delay</code>.</p>
+        </div>
+        <div class="card">
+          <h4>Daemon half: abort at step boundaries</h4>
+          <p class="muted">Guarantee <code class="r sur">NoTargetActionPastSessionLoss</code>: the daemon never <i>initiates</i> a target-side
+          step (target update, verify, session termination) unless its session is usable <b>and</b> <code class="r">execute_by</code> has not
+          passed. On transport loss, a terminal session (<span class="state bad">revoked</span>/<span class="state term">closed</span>) or a
+          lapsed lease it aborts at the <b>current step boundary</b> — never mid-API-call. The aborted attempt goes unreported (a report
+          needs a session); the server's existing <code class="r trig">ReleaseJob</code>/<code class="r trig">JobTimesOut</code> machinery
+          abandons it. A session merely <span class="state mid">expired</span> with a refresh in flight is <i>not</i> loss — the daemon
+          pauses at the boundary and continues in place.</p>
+        </div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h4>Claimed jobs are never cancelled</h4>
+          <p class="muted">Pausing a config, disabling a target, unassigning a daemon or changing settings only stops <b>new</b> offers
+          and claims (a still-pending job is also held un-claimable by <code class="r">is_claimable</code>). None of them cancels a
+          <span class="state mid">claimed</span> job: the daemon may already have reset the target-side password, and refusing its cipher
+          write would <i>manufacture</i> the vault-stale state the system exists to prevent — the write must be allowed to land.</p>
+        </div>
+        <div class="card">
+          <h4>The emergency brake is RevokeDaemon</h4>
+          <p class="muted">Revoking closes the daemon's transport; the daemon observes session loss and aborts at its next step boundary,
+          and the closed transport flips its <code class="r ent">DaemonConnection</code> disconnected, releasing the claimed job under the
+          lease. Staleness risk on the target is consciously accepted when firing a daemon. Two smaller guards complete the picture:
+          executing with <b>no active session at all</b> (the claim-to-start gap) fails fast with <code class="r">target_unchanged</code>
+          instead of wedging until <code class="r">job_ttl</code> (<code class="r trig">ExecuteRotationWithoutSession</code>), and a routine
+          <b>token expiry mid-rotation</b> is absorbed by the local retry loop while the session refreshes — it never fails an attempt
+          (that would wrongly spend the server retry budget); only a <i>rejected</i> refresh ends execution.</p>
+        </div>
+      </div>
+
       <h3>Verification and the failure sync-state</h3>
       <p>Step 4 of <code class="r trig">ExecuteRotation</code> <b>verifies the rotation</b>: the daemon confirms via the kind
       integration that the account now authenticates with the new password (e.g. an authentication probe — the per-kind mechanics
       are an open question). The rotation is not treated as succeeded until verification passes. Guarantee
       <code class="r sur">VerifiedBeforeSuccess</code>: a rotation is reported succeeded only after the new credential has been
       verified against the target system <i>and</i> the cipher write has been accepted — an unverified change is never reported
-      as success.</p>
+      as success. The server independently enforces the write half: <code class="r ent">RotationAttempt.cipher_updated</code> is set only by
+      <code class="r trig">AcceptCipherUpdate</code>, and <code class="r trig">RecordRotationSucceeded</code> refuses a success report without it
+      (audited <code class="r">report_rejected</code>) — a buggy daemon reporting success without writing cannot leave a succeeded job over a stale vault.</p>
       <p>A failure that survives the daemon's local retries carries the vault↔target <code class="r">sync_state</code> it left behind
       (<code class="r">FailureSyncState</code>, recorded on the errored attempt and audited):</p>
       <ul>
@@ -1003,7 +1131,12 @@ flowchart TD
       </ul>
       <p class="muted">Each attempt is independent and starts fresh: a new password is generated and both the target and the cipher
       are updated together, so a previous attempt's partial failure is converged by the next success — <code class="r">sync_state</code>
-      records the interim divergence.</p>
+      records the interim divergence. What makes that convergence <i>sound</i> is now an explicit guarantee,
+      <code class="r sur">RotationByAdministrativeReset</code>: every integration rotates by administrative reset — no step of a rotation may
+      depend on the <b>current</b> credential value (the integration authenticates with resolver-supplied service credentials, never with
+      the password being rotated). After a <span class="state mid">target_updated</span> failure the next attempt's independently generated
+      password can still be applied; a custom script doing a change-password rather than a reset would break this and must honour the
+      constraint too.</p>
 
       <h3>Session termination — folded into the attempt</h3>
       <p>Session termination is no longer a separate entity. It is a guidance-level <b>sub-step of executing the rotation</b>
@@ -1013,7 +1146,8 @@ flowchart TD
         <li>It has its <b>own local retry loop</b> using the daemon's <code class="r">max_retry_attempts</code> / <code class="r">retry_base_delay</code> budget — entirely the daemon's, mirroring the transient-step retry.</li>
         <li>Its outcome rides on the success report's <code class="r">session_termination</code> field and is recorded on <code class="r ent">RotationAttempt.session_termination</code> as a <code class="r">SessionTerminationOutcome</code>: <span class="state">not_requested</span> (none asked for) / <span class="state go">terminated</span> (succeeded) / <span class="state mid">term_failed</span> (its local retries exhausted).</li>
         <li>It <b>never fails or re-runs the rotation</b> (guarantee <code class="r sur">TerminationNeverFailsRotation</code>).</li>
-        <li>"Requested but unsupported" is impossible: <code class="r trig">CreateRotationConfig</code> validates <code class="r">terminate_sessions</code> against the target's <code class="r">supports_session_termination</code> at config time, so the capability flag is no longer even sent to the daemon.</li>
+        <li>As a target-side step it honours the step-boundary abort discipline: if the session is lost or <code class="r">execute_by</code> passes before it starts, it is simply not initiated (the rotation had already succeeded).</li>
+        <li>"Requested but unsupported" is impossible: <code class="r trig">CreateRotationConfig</code> (and <code class="r trig">UpdateRotationAccount</code>) validates <code class="r">terminate_sessions</code> against the target's <code class="r">supports_session_termination</code> at config time, so the capability flag is no longer even sent to the daemon.</li>
       </ul>
       <p class="muted">The rotation succeeds the moment the password is rotated, verified and the cipher synced (guarantee <code class="r sur">TerminationNeverFailsRotation</code>) — termination is never on that critical path.</p>
 
@@ -1035,15 +1169,76 @@ flowchart TD
         </div>
       </div>
       <p class="muted">The two budgets are separate config values (both default 5) on different specs. The local one absorbs glitches
-      cheaply; the server one is the outer round-trip for genuine failures and lets a struggling daemon fail over to another assigned one for free.</p>
+      cheaply; the server one is the outer round-trip for genuine failures and lets a struggling daemon fail over to another assigned one for free.
+      A token expiring mid-rotation is deliberately in the <i>local</i> bucket: the daemon refreshes in place and continues, because charging routine
+      housekeeping to the server's <code class="r">max_attempts</code> budget would be wrong. And neither budget governs a daemon <i>drop</i> —
+      that is the claim lease's job (<code class="r">release_delay</code>, 15&nbsp;min): a released job waits out the dropped claim's
+      <code class="r">execute_by</code>, not a retry backoff.</p>
+
+      <h3>Failure policy (§6.8) — alerts and auto-pause</h3>
+      <p>Formerly an open question, now specified. <code class="r trig">RotationFailed</code> (emitted by <code class="r trig">FailJob</code> and
+      <code class="r trig">JobTimesOut</code>) stays the seam; everything chains from it and ends at the pure-sink
+      <code class="r trig">OperatorAlertRaised(kind, rotation_config, severity, reason)</code> — like the audit sinks, no rule chains off it, and
+      <b>delivery mechanics</b> (email, in-product, paging) are deliberately out of scope, exactly as audit persistence is.</p>
+      <div class="grid2">
+        <div class="card">
+          <h4>Every terminal failure raises an alert</h4>
+          <p class="muted"><code class="r trig">AlertOnRotationFailed</code> passes the emit-site <code class="r">alert_kind</code> through —
+          <code class="r">job_failed</code> (budget exhausted), <code class="r">job_unroutable</code> (timed out with <b>zero attempts</b>: no eligible
+          daemon was ever connected/assigned) or <code class="r">job_stuck</code> (timed out while claimed) — and owns the severity policy:
+          <code class="r">alert_elevated</code> when <code class="r">sync_state = target_updated</code> (the vault now holds a <b>dead credential</b>)
+          or <code class="r">source = access_end</code> (a security-mandated rotation did not happen); otherwise <code class="r">alert_normal</code>.</p>
+        </div>
+        <div class="card">
+          <h4>Auto-pause after consecutive failures</h4>
+          <p class="muted"><code class="r ent">RotationConfig.consecutive_failures</code> is incremented on each terminal failure or timeout and reset
+          by a success or a recorded manual rotation. At <code class="r">max_consecutive_failures</code> (3, a placeholder tunable)
+          <code class="r trig">AutoPauseAfterConsecutiveFailures</code> pauses the <b>config</b> — never the target (a shared target keeps serving its
+          other configs) — audits <code class="r">auto_paused</code> and raises an elevated alert. This is what takes ownership of
+          <code class="r">next_rotation_at</code> on terminal failure: the <code class="r">failure_retry_delay</code> (1&nbsp;h) reschedule stands until
+          auto-pause, after which a paused config's <code class="r trig">RotationDue</code> cannot fire — ending the retry loop. Recovery is the
+          ordinary admin <code class="r trig">ResumeRotation</code>.</p>
+        </div>
+      </div>
+      <div class="card">
+        <h4>Overdue manual obligations escalate too</h4>
+        <p class="muted"><code class="r trig">AlertManualObligationOverdue</code> raises an elevated alert
+        (<code class="r">manual_obligation_overdue</code>) once a manual config's obligation has stood unmet past
+        <code class="r">manual_obligation_alert_after</code> (24&nbsp;h, a placeholder tunable). <code class="r">manual_obligation_alerted</code> is the
+        re-fire brake — a temporal trigger that changes no state would re-fire forever — and is reset whenever the obligation is cleared
+        (<code class="r trig">RecordManualRotation</code>) or a fresh one is raised, so each new obligation re-arms the alert.</p>
+      </div>
+
+      <h3>Dropped triggers &amp; catch-up — events are never lost, schedules may skip</h3>
+      <p>The organising principle, applied consistently across pause/resume and disable/enable: an <b>event</b> trigger (an access grant ending —
+      security-relevant, unrepeatable) must never be lost; a <b>schedule</b> may skip missed windows; and an <b>on-demand</b> trigger is deliberately
+      not latched — an admin can simply re-issue it.</p>
+      <ul>
+        <li><b>Latch:</b> an access-end for an automatic config that cannot be offered right now (config paused, or target disabled) sets
+        <code class="r">pending_access_end</code> and audits <code class="r">access_end_deferred</code>
+        (<code class="r trig">DeferAccessEndWhileUnavailable</code> — its guard is the exact complement of <code class="r trig">RotateOnAccessEnd</code>'s,
+        so an automatic access-end is either offered now or deferred, never dropped). A <i>paused manual</i> config latches likewise
+        (<code class="r trig">DeferManualAccessEndWhilePaused</code>); an enabled manual config has its obligation pulled due on the spot
+        (<code class="r trig">RaiseManualObligationOnAccessEnd</code>, audit <code class="r">manual_rotation_due</code>).</li>
+        <li><b>Discharge:</b> on <code class="r trig">ResumeRotation</code> or <code class="r trig">EnableTargetSystem</code> the latch is discharged
+        exactly once — an automatic config gets a deferred <code class="r trig">OfferRotation</code> with <code class="r">source: access_end</code>; a
+        manual config has <code class="r">next_rotation_at</code> pulled to now.</li>
+        <li><b>Schedule catch-up:</b> <code class="r trig">EnableTargetSystem</code> now recomputes <code class="r">next_rotation_at</code> from now for
+        each automatic config with a schedule, mirroring resume — missed windows are intentionally skipped, never fired as a backlog. And
+        <code class="r trig">ResumeRotation</code> never erases an <i>already-due</i> manual obligation: a manual config that owes one keeps
+        <code class="r">next_rotation_at</code> at now instead of recomputing past it.</li>
+      </ul>
+      <p class="muted">One residual gap is a live open question: an access-end arriving while the config is enabled, its target active <i>and a job
+      already in flight</i> currently fires neither the offer nor the defer rule (see §7).</p>
     </section>
 
     <!-- ===================== 7 OPEN QUESTIONS ===================== -->
     <section id="openq">
-      <h2><span class="num">7</span>Open questions</h2>
-      <p class="muted">Things the specs explicitly leave undecided, in plain language. Daemon-side first, then server-side.</p>
+      <h2><span class="num">7</span>Open questions &amp; resolutions</h2>
+      <p class="muted">What the specs still leave undecided, in plain language — and what the latest revision settled. Still-open
+      questions first (daemon-side, then server-side), then the resolved ones, each with a short statement of the decision.</p>
 
-      <h4>Daemon spec</h4>
+      <h4>Still open — daemon spec</h4>
       <details class="oq"><summary>Read blast radius (residual) <span class="oqtag">deferred</span></summary>
         <div class="oqbody">The org key the daemon holds is still the theoretical crypto blast radius — a daemon compromise <i>plus</i>
         an API-authorisation bypass would expose the whole org vault. Closing it at the crypto layer needs per-cipher item keys
@@ -1052,27 +1247,22 @@ flowchart TD
         <div class="oqbody">With no partial-content API, rotation re-PUTs the whole cipher, so the in-flight job authorises replacing the
         entire object and requires a read-before-write. A dedicated partial-update/rotate endpoint would remove the read and tighten
         write scope to the password field; a separate bearer write-token would add defence in depth against an ownership-check bug.</div></details>
-      <details class="oq"><summary>Credential re-issuance</summary>
-        <div class="oqbody">Once a daemon's credential is revoked, the session is terminal. How is a replacement credential provisioned and
-        delivered to the daemon? (Referenced by the terminal <code class="r">refused</code>/<code class="r">revoked</code> states.)</div></details>
       <details class="oq"><summary>Custom-script result format</summary>
         <div class="oqbody">How does a <code class="r">custom_script</code> integration report its result — exit code, stdout parsing, or
-        structured output? The spec leans toward exit code as simplest and most portable.</div></details>
+        structured output? The spec leans toward exit code as simplest and most portable. (A custom script must also honour
+        <code class="r sur">RotationByAdministrativeReset</code> — a change-password script that needs the old password would make a
+        <span class="state mid">target_updated</span> failure unrecoverable.)</div></details>
       <details class="oq"><summary>Verification mechanics per kind</summary>
         <div class="oqbody">Step 4 of <code class="r trig">ExecuteRotation</code> verifies the rotated credential before the rotation is reported
         succeeded. MSSQL can probe by opening a connection as the rotated login; Entra may not permit a plain password probe (MFA / conditional
         access can block it) and may need a directory-level confirmation instead; a custom script needs a verify operation in its contract.
         What does verification concretely mean for each kind — and may a kind opt out?</div></details>
-      <details class="oq"><summary>Mid-rotation disconnect</summary>
-        <div class="oqbody">When the daemon's connection drops mid-execution, its claim may be released server-side and re-claimed by another
-        daemon while this one is still acting on the target system (the cipher API is fenced; the target system is not). Should the daemon
-        abort in-flight execution on a connection drop? (See the claim-release race question, server side.)</div></details>
       <details class="oq"><summary>Credential resolver precedence</summary>
         <div class="oqbody">The default <code class="r">CredentialResolver</code> is environment variables, with Bitwarden Secrets Manager and a local config
         file as pluggable, opt-in resolvers. When more than one is configured, what is the precedence — and is it per-target or daemon-wide?
         The resolver encapsulates the lookup; the precedence policy is not yet pinned down.</div></details>
 
-      <h4>Server spec</h4>
+      <h4>Still open — server spec</h4>
       <details class="oq"><summary>account_identity integrity (server-tamper resistance) <span class="oqtag">deferred</span></summary>
         <div class="oqbody"><code class="r">account_identity</code> is stored server-side in plaintext on <code class="r ent">RotationConfig</code> and carried verbatim to the daemon on the
         claim (<code class="r trig">RotationClaimed</code>), where it picks which target-system account is rotated and session-terminated. A compromised or malicious server could
@@ -1087,10 +1277,6 @@ flowchart TD
         lease-id that is due for rotation <i>and</i> matches the target cipher — turning standing authority into a per-lease capability, so a stolen credential with no live, due lease
         grants nothing (defence in depth beyond <code class="r">JobBoundWrite</code>/<code class="r">ApiScopedReads</code>). Open whether it generalises to scheduled/on-demand jobs
         (no upstream lease) or applies only to access-end jobs.</div></details>
-      <details class="oq"><summary>Failure handling (§6.8)</summary>
-        <div class="oqbody"><code class="r trig">FailJob</code> and <code class="r trig">JobTimesOut</code> currently reschedule to a near-term retry and
-        emit <code class="r trig">RotationFailed</code> as the seam. §6.8 should define the real policy — alerting and auto-disable after a
-        threshold — and own <code class="r">next_rotation_at</code> on terminal failure.</div></details>
       <details class="oq"><summary>Collection-wide settings <span class="oqtag">deferred</span></summary>
         <div class="oqbody">Applying one set of rotation triggers across every managed credential in a collection at once. Deferred to keep Phase 1
         per-credential; the per-credential <code class="r trig">UpdateRotationSettings</code> path stands in. Revisit with the collection-membership resolution it needs.</div></details>
@@ -1100,19 +1286,6 @@ flowchart TD
       <details class="oq"><summary>Rotation throttling</summary>
         <div class="oqbody">Many credentials on one target coming due together could hammer that target. Not modelled (no fleet-scale
         deployment assumed); if needed, throttle in the daemon/connector rather than the server scheduler.</div></details>
-      <details class="oq"><summary>Unroutable-job escalation</summary>
-        <div class="oqbody">A job that stays <code class="r">pending</code> because no eligible daemon is connected/assigned waits until
-        <code class="r trig">JobTimesOut</code>. Past a threshold it should escalate to an operator; delivery shares the unspecified alerting seam.</div></details>
-      <details class="oq"><summary>Daemon connectivity edges</summary>
-        <div class="oqbody">Reconcile which daemon-side transitions (<code class="r ent">ServerConnection</code>/<code class="r ent">DaemonSession</code>) raise the
-        server's <code class="r trig">DaemonConnected</code>/<code class="r trig">DaemonDisconnected</code> edges — in particular whether a session expiry that is
-        <i>not</i> a transport drop counts as disconnected for claim eligibility.</div></details>
-      <details class="oq"><summary>Cancel-in-flight</summary>
-        <div class="oqbody">Should disabling a target, pausing a config, applying new settings, or unassigning a daemon <i>cancel</i> a
-        claimed job, or only stop new ones being offered? Today all four only stop new ones.</div></details>
-      <details class="oq"><summary>Manual-obligation escalation</summary>
-        <div class="oqbody">Beyond surfacing <code class="r">awaiting_manual_rotation</code>, should a manual obligation unmet past a threshold escalate —
-        notify, flag severity, or raise an alert?</div></details>
       <details class="oq"><summary>Access-event emitter binding</summary>
         <div class="oqbody">Which upstream systems wire into <code class="r trig">AccessGrantEnded</code> (PAM leases, AAP grants, …)? The signal shape is
         resolved (it carries only the cipher); the concrete set of emitters and how they register is still open.</div></details>
@@ -1125,26 +1298,84 @@ flowchart TD
         rotation events (the audit log being the authoritative record that a rotation happened), rather than a field the rotation machinery
         maintains? <code class="r">RotationConfig.last_rotation_at</code> exists server-side; this question is about surfacing rotation history
         on the cipher.</div></details>
-      <details class="oq"><summary>Disabled-target catch-up and dropped triggers</summary>
-        <div class="oqbody"><code class="r trig">EnableTargetSystem</code> does not recompute its configurations' <code class="r">next_rotation_at</code>
-        (unlike <code class="r trig">ResumeRotation</code>'s recompute-on-resume), so a schedule that came due while the target was disabled may stay
-        dormant after re-enable. And an on-demand <code class="r trig">TriggerRotation</code> or <code class="r trig">AccessGrantEnded</code> arriving while
-        the target is disabled is silently dropped (<code class="r trig">OfferRotation</code>'s guard fails — no job, no audit, no standing obligation),
-        which for <code class="r">access_end</code> loses a security-relevant rotation. Decide the catch-up semantics on enable and whether dropped
-        triggers should be audited or queued.</div></details>
-      <details class="oq"><summary>Claim-release race at the target system</summary>
-        <div class="oqbody"><code class="r trig">ReleaseJob</code> makes a dropped daemon's job claimable again after <code class="r">retry_base_delay</code>,
-        but a network-partitioned daemon may still be mid-rotation against the target when another daemon re-claims; the cipher write is fenced
-        (<code class="r sur">JobBoundWrite</code>) but the target system is not, so the two can interleave target-side updates and leave the vault and
-        target out of sync until a later rotation converges (an abandoned attempt reports no <code class="r">sync_state</code> by construction).
-        Candidate mitigations: the daemon aborts in-flight execution when its connection drops (see the mid-rotation disconnect question, daemon
-        side), and/or a dedicated release backoff sized to a worst-case rotation duration instead of <code class="r">retry_base_delay</code>.</div></details>
+      <details class="oq"><summary>Access-end during an active job is silently dropped <span class="oqtag">new</span> <span class="oqtag">deferred</span></summary>
+        <div class="oqbody"><code class="r trig">RotateOnAccessEnd</code> requires no active job, and <code class="r trig">DeferAccessEndWhileUnavailable</code>'s
+        guard (paused, or target disabled) is the exact complement only over enabled × target-status — it does not cover the
+        <code class="r">has_active_job</code> case. So an <code class="r trig">AccessGrantEnded</code> arriving while an automatic config is enabled, its
+        target active and a job pending or claimed fires <b>neither</b> rule: the event is lost, against the "an event trigger must never be lost"
+        principle. The in-flight job does not necessarily satisfy the access-end intent — its password may have been generated before the grant ended,
+        and it may yet fail terminally. Candidate resolutions: (a) latch <code class="r">pending_access_end</code> here too and discharge it when the
+        active job resolves; or (b) document the drop as deliberate on the grounds that the concurrent rotation satisfies the intent. (Manual configs
+        are unaffected — they never have jobs.)</div></details>
       <details class="oq"><summary>Method switching</summary>
         <div class="oqbody">Can an admin move a target between automatic and manual after creation (and supply/clear kind, policy, termination capability),
-        and what happens to its configs' schedules and any active jobs? <code class="r">ManualConfigNeverJobbed</code> assumes method is fixed at creation.</div></details>
+        and what happens to its configs' schedules and any active jobs? <code class="r">ManualConfigNeverJobbed</code> assumes method is fixed at creation.
+        (<code class="r trig">UpdateTargetSystemPolicy</code> now edits the policy and termination capability, but <code class="r">kind</code> — and method —
+        stay deliberately immutable: existing account identities are interpreted by the kind.)</div></details>
       <details class="oq"><summary>Secrets Manager support <span class="oqtag">Phase 1 non-goal</span></summary>
         <div class="oqbody">A future config would point at an SM secret rather than a <code class="r ent">daemon/Cipher</code>. Confirm the offer/claim/recovery/scheduling/audit
         machinery carries an SM rotation unchanged, and decide whether to generalise the cipher seam or add a parallel SM config.</div></details>
+
+      <h4>Resolved</h4>
+      <p class="muted">Formerly open, now specified behaviour. Each entry states the decision; the mechanics live in §3–§6.</p>
+      <details class="oq res"><summary>Mid-rotation disconnect → abort at step boundaries <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">New guarantee <code class="r sur">NoTargetActionPastSessionLoss</code>: the daemon never <i>initiates</i> a target-side step
+        (target update, verify, session termination) unless its session is usable and the claim's <code class="r">execute_by</code> lease has not passed.
+        On transport loss or a terminal session it aborts at the current step boundary — never mid-API-call; the attempt goes unreported (a report needs
+        a session) and the server abandons it via the existing <code class="r trig">ReleaseJob</code>/<code class="r trig">JobTimesOut</code> path. A session
+        merely <span class="state mid">expired</span> with a refresh in flight is <i>not</i> loss — pause and wait. Consequence:
+        <code class="r trig">RevokeDaemon</code> is now an effective in-flight brake.</div></details>
+      <details class="oq res"><summary>Claim-release race → the claim is a time-bounded lease <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">Both candidate mitigations adopted. <code class="r trig">ClaimRotation</code> stamps <code class="r">claimed_at</code>;
+        <code class="r">execute_by = claimed_at + release_delay</code> (15&nbsp;min, a dedicated recovery knob deliberately distinct from
+        <code class="r">retry_base_delay</code> — the 1-second value was the bug for release) rides on the claim snapshot;
+        <code class="r trig">ReleaseJob</code> makes the job re-claimable only at <code class="r">execute_by</code>, so a partitioned daemon has finished
+        or aborted (its own lease passed) before anyone re-claims. <code class="r trig">RetryJob</code> is unchanged for genuine failures.</div></details>
+      <details class="oq res"><summary>Token expiry mid-rotation → refresh in place <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">An expired access token during a server-facing step is a <b>transient</b>, absorbed by the local retry loop while
+        <code class="r trig">SessionExpires</code> → <code class="r trig">RefreshSession</code> completes; the attempt continues in place. It never fails
+        an attempt (that would wrongly spend the server's retry budget on routine housekeeping). Only a <i>rejected</i> refresh — the credential revoked
+        mid-rotation — ends execution, as session loss under the abort rule.</div></details>
+      <details class="oq res"><summary>Credential re-issuance → ReissueDaemonCredential <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">A new admin action on <code class="r sur">DaemonRegistrationView</code> for an enrolled daemon: fresh
+        <code class="r">client_secret</code> + <code class="r">encryption_key</code>, org key re-wrapped and
+        <code class="r">encrypted_organization_key</code> replaced, live session invalidated, new token shown once and delivered out of band; audited
+        <code class="r">daemon_credential_reissued</code>. Preserves registration identity, assignments and audit continuity.
+        <code class="r trig">RevokeDaemon</code> stays permanent decommission — recovery from revoked is a <i>new</i> registration, by design.</div></details>
+      <details class="oq res"><summary>Failure handling (§6.8) → alerts + auto-pause specified <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody"><code class="r trig">RotationFailed</code> stays the seam. <code class="r trig">AlertOnRotationFailed</code> raises the pure-sink
+        <code class="r trig">OperatorAlertRaised</code> on every terminal failure/timeout — severity elevated when <code class="r">sync_state =
+        target_updated</code> (the vault holds a dead credential) or <code class="r">source = access_end</code> (a security-mandated rotation did not
+        happen). <code class="r">consecutive_failures</code> accrues per terminal failure/timeout and at <code class="r">max_consecutive_failures</code> (3)
+        the <b>config</b> — never the target — auto-pauses (audit <code class="r">auto_paused</code>, elevated alert). §6.8 thereby owns
+        <code class="r">next_rotation_at</code> on terminal failure. Alert <i>delivery</i> stays out of scope.</div></details>
+      <details class="oq res"><summary>Unroutable-job escalation → folded into §6.8 <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody"><code class="r trig">JobTimesOut</code> now distinguishes <code class="r">job_unroutable</code> (timed out with zero attempts —
+        no eligible daemon was ever connected/assigned) from <code class="r">job_stuck</code> (timed out while claimed) via the
+        <code class="r">alert_kind</code> on <code class="r trig">RotationFailed</code>, and the operator alert rides the shared
+        <code class="r trig">OperatorAlertRaised</code> seam.</div></details>
+      <details class="oq res"><summary>Manual-obligation escalation → AlertManualObligationOverdue <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">An elevated <code class="r">manual_obligation_overdue</code> alert fires once a manual config's obligation stands unmet past
+        <code class="r">manual_obligation_alert_after</code> (24&nbsp;h). <code class="r">manual_obligation_alerted</code> is the re-fire brake, reset when
+        the obligation is cleared or a fresh one is raised, so each new obligation re-arms the alert.</div></details>
+      <details class="oq res"><summary>Daemon connectivity edges → transport-only <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody"><code class="r trig">DaemonConnected</code>/<code class="r trig">DaemonDisconnected</code> map exclusively to the authenticated
+        <b>transport</b> coming up/down, never to session state. A session expiry with the transport up is <i>not</i> disconnected — flipping it would
+        release a healthy daemon's job mid-refresh, and it is unnecessary for eligibility because <code class="r trig">ClaimRotation</code> re-validates
+        the OAuth token per claim. A rejected refresh or a revocation closes the transport, and <i>that</i> raises disconnected.</div></details>
+      <details class="oq res"><summary>Cancel-in-flight → claimed jobs are never cancelled <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody">Pause, disable, unassign and settings changes only stop <b>new</b> offers and claims (a still-pending job is also held
+        un-claimable). None cancels a claimed job: the daemon may already have reset the target-side password, and refusing its cipher write would
+        <i>manufacture</i> the vault-stale state the system exists to prevent — the write must land. The emergency brake for a runaway daemon is
+        <code class="r trig">RevokeDaemon</code>, via the step-boundary abort.</div></details>
+      <details class="oq res"><summary>Disabled-target catch-up &amp; dropped triggers → events never lost, schedules may skip <span class="oqtag res">resolved</span></summary>
+        <div class="oqbody"><code class="r trig">EnableTargetSystem</code> now recomputes <code class="r">next_rotation_at</code> from now (missed windows
+        skipped, mirroring resume). An access-end that cannot be offered right now is latched on <code class="r">pending_access_end</code> (audit
+        <code class="r">access_end_deferred</code>; <code class="r trig">DeferAccessEndWhileUnavailable</code> / <code class="r trig">DeferManualAccessEndWhilePaused</code>)
+        and discharged on <code class="r trig">ResumeRotation</code>/<code class="r trig">EnableTargetSystem</code> — a deferred offer with
+        <code class="r">source: access_end</code>, or a manual obligation pulled due. <code class="r trig">ResumeRotation</code> never erases an
+        already-due manual obligation. On-demand triggers are deliberately <i>not</i> latched (an admin can re-issue). The residual
+        has-active-job gap is the new open question above.</div></details>
     </section>
 
     <!-- ===================== 8 SCENARIOS ===================== -->
@@ -1164,14 +1395,17 @@ flowchart TD
           </div>
           <button class="reveal">Reveal answer</button>
           <div class="answer">
-            <div class="verdict">The claim is released; it is <b>not</b> charged against the retry budget.</div>
+            <div class="verdict">The claim is released; it is <b>not</b> charged against the retry budget — and the job stays locked until the dropped claim's lease elapses.</div>
             <p>The server sees the drop and runs <code class="r trig">DaemonConnectionDropsReleaseJobs</code>, which fires
             <code class="r trig">ReleaseJob</code> only for jobs <code class="r">claimed_by</code> that daemon. The job goes back to
             <span class="state mid">pending</span>, <code class="r">claimed_by</code> is cleared, and crucially the in-flight server-owned attempt is marked
             <span class="state term">abandoned</span> (<code class="r trig">AbandonAttempt</code>) rather than <span class="state bad">errored</span> — and
             <code class="r">failed_attempts</code> counts only <span class="state bad">errored</span> attempts, so losing connectivity is never charged to the budget.
-            After a backoff any connected, assigned daemon (or the same one on reconnect) re-claims it for a fresh attempt. The <code class="r">expires_at</code> deadline still backstops via <code class="r trig">JobTimesOut</code>.</p>
-            <div class="rules"><b>Rules:</b> DaemonConnectionDropsReleaseJobs · ReleaseJob · AbandonAttempt (attempt abandoned) · (audit: released) · JobTimesOut (backstop)</div>
+            The job becomes re-claimable only at the dropped claim's <code class="r">execute_by</code> (<code class="r">claimed_at + release_delay</code>, 15&nbsp;min — <b>not</b> the 1-second retry backoff),
+            because the dropped daemon may still be mid-rotation against the target; daemon-side it aborts at its next step boundary and never acts past its own <code class="r">execute_by</code>
+            (<code class="r sur">NoTargetActionPastSessionLoss</code>). Then any connected, assigned daemon (or the same one on reconnect) re-claims it for a fresh attempt.
+            The <code class="r">expires_at</code> deadline still backstops via <code class="r trig">JobTimesOut</code>.</p>
+            <div class="rules"><b>Rules:</b> DaemonConnectionDropsReleaseJobs · ReleaseJob (lease: next_claimable_at = execute_by) · AbandonAttempt (attempt abandoned) · NoTargetActionPastSessionLoss (daemon abort) · (audit: released) · JobTimesOut (backstop)</div>
           </div>
         </div>
 
@@ -1202,16 +1436,19 @@ flowchart TD
           </div>
           <button class="reveal">Reveal answer</button>
           <div class="answer">
-            <div class="verdict">The job fails terminally and the config is rescheduled to a near-term retry.</div>
+            <div class="verdict">The job fails terminally, an operator alert is raised, and repeated terminal failures auto-pause the config.</div>
             <p>When the daemon's failure report transitions the 5th attempt to <span class="state bad">errored</span>, <code class="r">has_retry_budget</code> no longer
             holds (<code class="r">failed_attempts.count &gt;= max_attempts</code>), so <code class="r trig">FailJob</code> fires instead of <code class="r trig">RetryJob</code>: job →
             <span class="state bad term">failed</span> (terminal), <code class="r">next_rotation_at</code> set to
-            <code class="r">now + failure_retry_delay</code> (1 hour), audit <code class="r">failed</code>, and <code class="r trig">RotationFailed</code> is
-            emitted as the seam for the not-yet-specified §6.8 failure-handling policy (alerting / auto-disable). The last attempt's
-            <code class="r">sync_state</code> rides on both emissions — a job that terminally fails <span class="state mid">target_updated</span> has left the stored
-            cipher stale, and the audit log carries that fact. Only <span class="state bad">errored</span>
-            attempts count toward this budget — any <span class="state">abandoned</span> ones along the way are not. The near-term reschedule keeps the credential live until §6.8 lands.</p>
-            <div class="rules"><b>Rules:</b> RecordRotationFailed → attempt errored · FailJob · RotationFailed (seam) · open question §6.8</div>
+            <code class="r">now + failure_retry_delay</code> (1 hour), <code class="r">consecutive_failures</code> incremented, audit <code class="r">failed</code>, and
+            <code class="r trig">RotationFailed</code> is emitted as the §6.8 seam. From it, <code class="r trig">AlertOnRotationFailed</code> raises
+            <code class="r trig">OperatorAlertRaised</code> (<code class="r">job_failed</code>) — <b>elevated</b> if the last attempt's
+            <code class="r">sync_state</code> is <span class="state mid">target_updated</span> (the vault now holds a dead credential) or the rotation was
+            <code class="r">access_end</code>-mandated. At <code class="r">max_consecutive_failures</code> (3) consecutive terminal failures,
+            <code class="r trig">AutoPauseAfterConsecutiveFailures</code> pauses the <b>config</b> (never the target), audits <code class="r">auto_paused</code>
+            and alerts — ending the hourly retry loop until an admin resumes. A success (or recorded manual rotation) resets the count. Only
+            <span class="state bad">errored</span> attempts count toward the budget — <span class="state">abandoned</span> ones are not.</p>
+            <div class="rules"><b>Rules:</b> RecordRotationFailed → attempt errored · FailJob (consecutive_failures + 1) · RotationFailed (seam) · AlertOnRotationFailed → OperatorAlertRaised · AutoPauseAfterConsecutiveFailures (audit: auto_paused)</div>
           </div>
         </div>
 
@@ -1222,13 +1459,15 @@ flowchart TD
           </div>
           <button class="reveal">Reveal answer</button>
           <div class="answer">
-            <div class="verdict">It waits as <span class="state mid">pending</span>, then times out at the deadline.</div>
+            <div class="verdict">It waits as <span class="state mid">pending</span>, then times out at the deadline — flagged to an operator as <i>unroutable</i>.</div>
             <p><code class="r trig">OfferRotation</code> created the job <span class="state mid">pending</span> and the server push-notified eligible
-            daemons — but with none connected/assigned it simply waits. The moment one connects or is assigned it can be claimed (no re-offer
-            needed, the job is already pending). If nothing claims it before <code class="r">created_at + job_ttl</code>, <code class="r trig">JobTimesOut</code>
-            declares it <span class="state bad term">timed_out</span>, reschedules the config, and emits <code class="r trig">RotationFailed</code>.
-            (Escalating an unroutable job sooner is an open question.)</p>
-            <div class="rules"><b>Rules:</b> OfferRotation · ClaimRotation (when a daemon appears) · JobTimesOut · open question: unroutable-job escalation</div>
+            daemons — and it is re-announced the moment a daemon connects (<code class="r trig">NotifyClaimableJobsOnConnect</code>) or a late assignment
+            lands (<code class="r trig">NotifyPendingJobsOnAssignment</code>), so it can be claimed with no re-offer (the job is already pending). If nothing
+            claims it before <code class="r">created_at + job_ttl</code>, <code class="r trig">JobTimesOut</code> declares it
+            <span class="state bad term">timed_out</span>, reschedules the config, increments <code class="r">consecutive_failures</code> and emits
+            <code class="r trig">RotationFailed</code> with <code class="r">alert_kind = job_unroutable</code> (zero attempts — distinguished from a stuck
+            claiming daemon, <code class="r">job_stuck</code>), which <code class="r trig">AlertOnRotationFailed</code> turns into an operator alert.</p>
+            <div class="rules"><b>Rules:</b> OfferRotation · NotifyClaimableJobsOnConnect / NotifyPendingJobsOnAssignment · ClaimRotation (when a daemon appears) · JobTimesOut (job_unroutable) · AlertOnRotationFailed → OperatorAlertRaised</div>
           </div>
         </div>
 
@@ -1245,8 +1484,10 @@ flowchart TD
             <code class="r trig">HandleAuthenticationRejected</code> sets the session <span class="state bad term">revoked</span> and emits
             <code class="r trig">ConnectionRefused</code>, so <code class="r trig">RefuseConnection</code> drives the <code class="r ent">ServerConnection</code> to
             <span class="state bad term">refused</span> — a <b>terminal</b> state. Unlike a transient drop (which <code class="r trig">Reconnect</code> retries with backoff),
-            the daemon does not reconnect, because re-presenting a rejected credential would loop forever. A replacement credential must be provisioned (open question).</p>
-            <div class="rules"><b>Rules:</b> HandleAuthenticationRejected · RefuseConnection · (contrast: Reconnect) · open question: credential re-issuance</div>
+            the daemon does not reconnect, because re-presenting a rejected credential would loop forever. Recovery: the server reissues a credential
+            in place (<code class="r trig">ReissueDaemonCredential</code> — identity and assignments preserved, token shown once) and the operator restarts
+            the daemon with the new token, which <code class="r trig">DaemonStarts</code> permits after a terminal refusal.</p>
+            <div class="rules"><b>Rules:</b> HandleAuthenticationRejected · RefuseConnection · (contrast: Reconnect) · ReissueDaemonCredential · DaemonStarts (restart after refusal)</div>
           </div>
         </div>
 
@@ -1257,14 +1498,16 @@ flowchart TD
           </div>
           <button class="reveal">Reveal answer</button>
           <div class="answer">
-            <div class="verdict">The in-flight claimed job runs to completion; only <b>new</b> rotations are stopped.</div>
+            <div class="verdict">The in-flight claimed job runs to completion — <b>by design</b>; only new rotations are stopped.</div>
             <p><code class="r trig">DisableTargetSystem</code> sets the target <span class="state bad">disabled</span> and audits it
             (<code class="r trig">AdministrationAudited</code>: <code class="r">target_disabled</code>). <code class="r trig">OfferRotation</code>
-            requires <code class="r">target_system.status = active</code>, so no new job is created while disabled — but jobs already
-            <span class="state mid">claimed</span> are explicitly unaffected and finish normally. Whether disabling should also cancel a claimed job is the
-            cancel-in-flight open question (today it does not); a trigger arriving while disabled is silently dropped, which is the
-            disabled-target catch-up open question.</p>
-            <div class="rules"><b>Rules:</b> DisableTargetSystem · AdministrationAudited (target_disabled) · OfferRotation (guard) · open questions: cancel-in-flight, disabled-target catch-up</div>
+            requires <code class="r">target_system.status = active</code>, so no new job is created while disabled, and a still-<span class="state mid">pending</span>
+            job is held un-claimable (<code class="r">is_claimable</code>). But a <span class="state mid">claimed</span> job is deliberately <b>never cancelled</b>
+            (resolved): the daemon may already have reset the target-side password, and refusing its cipher write would manufacture the vault-stale state the
+            system exists to prevent — the write must land. (The emergency brake for a runaway daemon is <code class="r trig">RevokeDaemon</code>.) Triggers are no
+            longer silently dropped either: an access-end while disabled is latched (<code class="r">pending_access_end</code>, audit
+            <code class="r">access_end_deferred</code>), and re-enabling recomputes schedules (missed windows skipped) and discharges the deferral.</p>
+            <div class="rules"><b>Rules:</b> DisableTargetSystem · AdministrationAudited (target_disabled) · OfferRotation / is_claimable (guards) · DeferAccessEndWhileUnavailable · EnableTargetSystem (catch-up) · resolved: cancel-in-flight</div>
           </div>
         </div>
 
@@ -1278,10 +1521,13 @@ flowchart TD
             <div class="verdict">No daemon is dispatched — it becomes an admin obligation to record.</div>
             <p><code class="r trig">RotationDue</code> requires <code class="r">method = automatic</code>, so it never fires for a manual config —
             and <code class="r">ManualConfigNeverJobbed</code> guarantees a manual config is never jobbed at all. Instead the config's
-            <code class="r">awaiting_manual_rotation</code> flag becomes true and is surfaced to the admin. After rotating out of band, the admin runs
-            <code class="r trig">RecordManualRotation</code>, which sets <code class="r">last_rotation_at</code>, reschedules <code class="r">next_rotation_at</code>, and writes
-            an audit (<code class="r">manual_recorded</code>, with actor) — exactly as a successful auto rotation would.</p>
-            <div class="rules"><b>Rules:</b> RotationDue (guard) · ManualConfigNeverJobbed (invariant) · RecordManualRotation</div>
+            <code class="r">awaiting_manual_rotation</code> flag becomes true and is surfaced to the admin. If the obligation stands unmet past
+            <code class="r">manual_obligation_alert_after</code> (24&nbsp;h), <code class="r trig">AlertManualObligationOverdue</code> raises an elevated operator
+            alert (once — <code class="r">manual_obligation_alerted</code> is the re-fire brake). After rotating out of band, the admin runs
+            <code class="r trig">RecordManualRotation</code>, which sets <code class="r">last_rotation_at</code>, reschedules <code class="r">next_rotation_at</code>,
+            resets the alert brake and <code class="r">consecutive_failures</code>, and writes an audit (<code class="r">manual_recorded</code>, with actor) —
+            exactly as a successful auto rotation would.</p>
+            <div class="rules"><b>Rules:</b> RotationDue (guard) · ManualConfigNeverJobbed (invariant) · AlertManualObligationOverdue (24 h) · RecordManualRotation</div>
           </div>
         </div>
 
@@ -1336,8 +1582,11 @@ flowchart TD
             <code class="r">claimed_by</code> equals the writer. After release/re-claim the original daemon's old attempt is already <span class="state term">abandoned</span>
             and the claimed job belongs to a different daemon, so <code class="r trig">RejectCipherUpdate</code> fires instead — audit <code class="r">write_rejected</code>.
             The daemon surfaces this as a failed attempt (<code class="r trig">ReportRotationFailed</code>); if budget remains the job becomes claimable for a fresh attempt.
-            The same rejection fences off late writes after a job has <span class="state go">succeeded</span> or <span class="state bad">timed out</span>.</p>
-            <div class="rules"><b>Rules:</b> AcceptCipherUpdate (guard) · RejectCipherUpdate · ReportRotationFailed · guarantee JobBoundWrite</div>
+            The same rejection fences off late writes after a job has <span class="state go">succeeded</span> or <span class="state bad">timed out</span> — and a late
+            <i>outcome report</i> from the fenced-off daemon is likewise refused and audited (<code class="r trig">RejectStaleSuccessReport</code> /
+            <code class="r trig">RejectStaleFailureReport</code>: <code class="r">report_rejected</code>). Note the re-claim itself could only have happened after the
+            original claim's <code class="r">execute_by</code> lease elapsed.</p>
+            <div class="rules"><b>Rules:</b> AcceptCipherUpdate (guard) · RejectCipherUpdate · RejectStaleSuccessReport / RejectStaleFailureReport · ReportRotationFailed · guarantee JobBoundWrite</div>
           </div>
         </div>
 
@@ -1352,8 +1601,10 @@ flowchart TD
             <p><code class="r trig">ClaimRotation</code> and the <code class="r sur">EligibleClaimsOnly</code> guarantee require the claimant be enrolled,
             connected, assigned <b>and</b> presenting a valid OAuth access token tied to a still-active session. The server does not trust the
             persistent connection alone, so an expired token (or a revoked credential) is rejected at claim time. Daemon-side, the session would have
-            gone <span class="state mid">expired</span> (<code class="r trig">SessionExpires</code>) and must re-authenticate via <code class="r trig">RefreshSession</code> before claiming.</p>
-            <div class="rules"><b>Rules:</b> ClaimRotation (token re-validation) · EligibleClaimsOnly · SessionExpires · RefreshSession</div>
+            gone <span class="state mid">expired</span> (<code class="r trig">SessionExpires</code>) and must re-authenticate via <code class="r trig">RefreshSession</code> before claiming.
+            Note the expiry does <b>not</b> mark the daemon disconnected server-side (the edges are transport-only) — its claimed jobs are not released
+            mid-refresh; the per-claim token check is exactly what makes that safe.</p>
+            <div class="rules"><b>Rules:</b> ClaimRotation (token re-validation) · EligibleClaimsOnly · SessionExpires · RefreshSession · DaemonConnectivity (transport-only edges)</div>
           </div>
         </div>
 
@@ -1386,6 +1637,63 @@ flowchart TD
             rejected. This is how load-balancing emerges across an HA pool — whichever eligible daemon claims first does the work, and a busy daemon simply
             does not claim. (The invariant <code class="r">AtMostOneActiveJobPerConfig</code> also keeps a single credential from rotating concurrently.)</p>
             <div class="rules"><b>Rules:</b> ClaimRotation (pending guard, "first claim wins") · AtMostOneActiveJobPerConfig</div>
+          </div>
+        </div>
+
+        <div class="qcard">
+          <div class="scenario">
+            <div class="tagline">In-flight brake</div>
+            <div class="q">An admin revokes a daemon (<code class="r trig">RevokeDaemon</code>) while it is mid-rotation — it has already reset the target-side password but not yet written the cipher. What stops the daemon, and what happens to the job?</div>
+          </div>
+          <button class="reveal">Reveal answer</button>
+          <div class="answer">
+            <div class="verdict">The revoke closes the transport; the daemon aborts at its next step boundary, and the job is abandoned and released under the lease.</div>
+            <p>Revoking is the deliberate <b>in-flight brake</b> (pause/disable/unassign never touch a claimed job). The server closes the daemon's
+            transport; daemon-side the drop closes its session (<code class="r trig">ConnectionDropClosesSessions</code>) and, per
+            <code class="r sur">NoTargetActionPastSessionLoss</code>, it never initiates the next target-side step — aborting at the step boundary, never
+            mid-API-call. The attempt goes unreported (a report needs a session); server-side the closed transport flips the daemon disconnected,
+            <code class="r trig">DaemonConnectionDropsReleaseJobs</code> → <code class="r trig">ReleaseJob</code> abandons the attempt (not charged) and the
+            job re-opens only at the dropped claim's <code class="r">execute_by</code>. The next claim's fresh, independently generated password converges
+            the target-updated divergence — sound because no rotation step depends on the current credential value
+            (<code class="r sur">RotationByAdministrativeReset</code>). Staleness risk in the window is consciously accepted when firing a daemon.</p>
+            <div class="rules"><b>Rules:</b> RevokeDaemon · ConnectionDropClosesSessions · NoTargetActionPastSessionLoss (step-boundary abort) · DaemonConnectionDropsReleaseJobs · ReleaseJob (lease) · RotationByAdministrativeReset</div>
+          </div>
+        </div>
+
+        <div class="qcard">
+          <div class="scenario">
+            <div class="tagline">Deferred trigger</div>
+            <div class="q">A PAM lease over a managed credential ends while its rotation config is <b>paused</b> for a change freeze. The security-mandated rotation cannot be offered right now. Is the signal lost?</div>
+          </div>
+          <button class="reveal">Reveal answer</button>
+          <div class="answer">
+            <div class="verdict">No — it is latched and discharged on resume. Event triggers are never lost.</div>
+            <p><code class="r trig">DeferAccessEndWhileUnavailable</code> fires (its guard is the exact complement of
+            <code class="r trig">RotateOnAccessEnd</code>'s, so an automatic access-end is either offered now or deferred, never dropped): it latches
+            <code class="r">pending_access_end</code> and audits <code class="r">access_end_deferred</code>, so the event leaves a trace immediately. On
+            <code class="r trig">ResumeRotation</code> the deferral is discharged as a fresh <code class="r trig">OfferRotation</code> with
+            <code class="r">source: access_end</code> (on a manual config the obligation is pulled due instead). The same discharge runs on
+            <code class="r trig">EnableTargetSystem</code> for a disabled target. Contrast the schedule: windows missed during the pause are deliberately
+            skipped on resume, and an on-demand trigger is deliberately not latched — an admin can re-issue it.</p>
+            <div class="rules"><b>Rules:</b> DeferAccessEndWhileUnavailable / DeferManualAccessEndWhilePaused · ResumeRotation / EnableTargetSystem (discharge) · audit: access_end_deferred · contrast: RotationDue (schedules skip)</div>
+          </div>
+        </div>
+
+        <div class="qcard">
+          <div class="scenario">
+            <div class="tagline">Token expiry mid-rotation</div>
+            <div class="q">A long rotation straddles the daemon's short-lived access token: it expires right as the daemon goes to write the cipher (the target is already updated and verified). Does the attempt fail with <code class="r">target_updated</code>?</div>
+          </div>
+          <button class="reveal">Reveal answer</button>
+          <div class="answer">
+            <div class="verdict">No — the daemon refreshes in place; token expiry never fails an attempt.</div>
+            <p>An expired token during a server-facing step is a <b>transient</b>: the local retry loop absorbs it while the existing
+            <code class="r trig">SessionExpires</code> → <code class="r trig">RefreshSession</code> → <span class="state go">active</span> cycle completes
+            (bounded by <code class="r">execute_by</code>), and the attempt continues where it paused. Failing it would wrongly spend the server's
+            <code class="r">max_attempts</code> budget on routine housekeeping. The expiry also does not release the job — the server's connectivity edges
+            are transport-only. Only a <b>rejected</b> refresh (the credential was revoked mid-rotation) ends execution: that is session loss, so the
+            daemon aborts at the step boundary, the attempt goes unreported, and the server abandons it.</p>
+            <div class="rules"><b>Rules:</b> ExecuteRotation (refresh-in-place, local retry) · SessionExpires · RefreshSession · DaemonConnectivity (transport-only) · NoTargetActionPastSessionLoss (rejected refresh)</div>
           </div>
         </div>
 
